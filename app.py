@@ -726,10 +726,10 @@ def run_agent(message, history, selected_tools, model_id, client_ip: str = ""):
 # UI
 # ============================================================
 
-with gr.Blocks(title="Provider Multi-Model Agent", theme=gr.themes.Soft()) as demo:
+with gr.Blocks(title="LLM + Agent tools demo", theme=gr.themes.Soft()) as demo:
     gr.Markdown(
-        "# Provider Multi-Model Agent\n"
-        "Provider-backed models only, with selectable tools and extended debugging."
+        "# LLM + Agent tools demo\n"
+        "with selectable tools and extended debugging."
     )
 
     with gr.Row():
