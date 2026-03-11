@@ -4,7 +4,7 @@ import uuid
 import random
 import warnings
 import traceback
-import threading
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
@@ -105,8 +105,8 @@ LLM_CACHE: Dict[str, object] = {}
 AGENT_CACHE: Dict[Tuple[str, Tuple[str, ...]], object] = {}
 RUNTIME_HEALTH: Dict[str, str] = {}
 
-# Thread-local storage so each Gradio request can carry the real client IP
-_request_context = threading.local()
+# ContextVar propagates into LangChain worker threads automatically (unlike threading.local)
+_client_location: ContextVar[str] = ContextVar("client_location", default="")
 
 
 # ============================================================
@@ -408,7 +408,7 @@ def generate_uuid(_: str = "") -> str:
 @tool
 def get_user_location(_: str = "") -> str:
     """Determine the user's precise physical location using browser GPS/WiFi coordinates or IP fallback."""
-    location_data = getattr(_request_context, "client_ip", "") or ""
+    location_data = _client_location.get()
 
     # Precise coordinates from browser geolocation API
     if location_data and not location_data.startswith("ip:"):
@@ -579,6 +579,7 @@ def build_debug_report(
     lines.append(f"model_id: {model_id}")
     lines.append(f"user_message: {message}")
     lines.append(f"selected_tools: {selected_tools}")
+    lines.append(f"client_location_value: {repr(_client_location.get())}")
     lines.append(f"message_count: {len(messages)}")
     lines.append(f"chart_path: {chart_path}")
     lines.append("")
@@ -629,8 +630,8 @@ def build_debug_report(
 def run_agent(message, history, selected_tools, model_id, client_ip: str = ""):
     history = history or []
 
-    # Store location data in thread-local so get_user_location can read it
-    _request_context.client_ip = client_ip.strip() if client_ip else ""
+    # Store location data via ContextVar so LangChain worker threads can read it
+    _client_location.set(client_ip.strip() if client_ip else "")
 
     if not message or not str(message).strip():
         return history, "No input provided.", "", None, model_status_text(model_id), "No input provided."
