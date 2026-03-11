@@ -757,6 +757,15 @@ with gr.Blocks(title="Provider Multi-Model Agent", theme=gr.themes.Soft()) as de
 
             chart_output = gr.Image(label="Generated chart", type="filepath")
 
+            with gr.Row():
+                location_btn = gr.Button("📍 Share my location", size="sm")
+                location_status = gr.Textbox(
+                    value="Location not set — click the button above before asking 'where am I'",
+                    label="Location status",
+                    interactive=False,
+                    max_lines=1,
+                )
+
         with gr.Column(scale=1):
             enabled_tools = gr.CheckboxGroup(
                 choices=TOOL_NAMES,
@@ -775,42 +784,45 @@ with gr.Blocks(title="Provider Multi-Model Agent", theme=gr.themes.Soft()) as de
         interactive=False,
     )
 
-    # Populated by JavaScript on page load with precise browser coordinates (GPS/WiFi),
-    # stored as "lat,lon". Falls back to the public IP via ipify if geolocation is denied.
+    # Hidden: holds "lat,lon" or "ip:<address>" set by the location button
     client_ip_box = gr.Textbox(visible=False, value="")
-
-    demo.load(
-        fn=None,
-        inputs=None,
-        outputs=[client_ip_box],
-        js="""async () => {
-            return new Promise((resolve) => {
-                if (navigator.geolocation) {
-                    navigator.geolocation.getCurrentPosition(
-                        (pos) => resolve(pos.coords.latitude + ',' + pos.coords.longitude),
-                        async () => {
-                            try {
-                                const r = await fetch('https://api.ipify.org?format=json');
-                                const d = await r.json();
-                                resolve('ip:' + d.ip);
-                            } catch(e) { resolve(''); }
-                        },
-                        {timeout: 8000, maximumAge: 60000}
-                    );
-                } else {
-                    fetch('https://api.ipify.org?format=json')
-                        .then(r => r.json())
-                        .then(d => resolve('ip:' + d.ip))
-                        .catch(() => resolve(''));
-                }
-            });
-        }""",
-    )
 
     model_dropdown.change(
         fn=model_status_text,
         inputs=[model_dropdown],
         outputs=[model_status],
+        show_api=False,
+    )
+
+    # Geolocation button: JS runs in the browser, result goes to hidden box + status label
+    location_btn.click(
+        fn=None,
+        inputs=None,
+        outputs=[client_ip_box, location_status],
+        js="""async () => {
+            return new Promise((resolve) => {
+                const fallback = async () => {
+                    try {
+                        const r = await fetch('https://api.ipify.org?format=json');
+                        const d = await r.json();
+                        resolve(['ip:' + d.ip, 'Location: IP-based fallback (approximate)']);
+                    } catch(e) {
+                        resolve(['', 'Location detection failed.']);
+                    }
+                };
+                if (!navigator.geolocation) { fallback(); return; }
+                navigator.geolocation.getCurrentPosition(
+                    (pos) => {
+                        const lat = pos.coords.latitude.toFixed(5);
+                        const lon = pos.coords.longitude.toFixed(5);
+                        const acc = Math.round(pos.coords.accuracy);
+                        resolve([lat + ',' + lon, `\u2705 GPS/WiFi location set (\u00b1${acc}m)`]);
+                    },
+                    fallback,
+                    {timeout: 10000, maximumAge: 60000, enableHighAccuracy: true}
+                );
+            });
+        }""",
         show_api=False,
     )
 
