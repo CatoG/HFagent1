@@ -7,6 +7,7 @@ import traceback
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
+import requests
 from dotenv import load_dotenv
 
 warnings.filterwarnings("ignore", category=UserWarning, module="wikipedia")
@@ -400,6 +401,28 @@ def generate_uuid(_: str = "") -> str:
     return str(uuid.uuid4())
 
 
+@tool
+def get_user_location(_: str = "") -> str:
+    """Determine the user's approximate physical location based on their public IP address."""
+    try:
+        response = requests.get("http://ip-api.com/json/", timeout=5)
+        response.raise_for_status()
+        data = response.json()
+        if data.get("status") != "success":
+            return f"Location lookup failed: {data.get('message', 'unknown error')}"
+        return (
+            f"City: {data.get('city', 'N/A')}\n"
+            f"Region: {data.get('regionName', 'N/A')}\n"
+            f"Country: {data.get('country', 'N/A')} ({data.get('countryCode', 'N/A')})\n"
+            f"Latitude: {data.get('lat', 'N/A')}\n"
+            f"Longitude: {data.get('lon', 'N/A')}\n"
+            f"Timezone: {data.get('timezone', 'N/A')}\n"
+            f"ISP: {data.get('isp', 'N/A')}"
+        )
+    except requests.RequestException as exc:
+        return f"Location lookup failed: {exc}"
+
+
 ALL_TOOLS = {
     "add_numbers": add_numbers,
     "subtract_numbers": subtract_numbers,
@@ -418,6 +441,7 @@ ALL_TOOLS = {
     "wikipedia_chaos_oracle": wikipedia_chaos_oracle,
     "random_number": random_number,
     "generate_uuid": generate_uuid,
+    "get_user_location": get_user_location,
 }
 TOOL_NAMES = list(ALL_TOOLS.keys())
 
