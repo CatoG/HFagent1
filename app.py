@@ -4,6 +4,7 @@ import uuid
 import random
 import warnings
 import traceback
+import threading
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
@@ -103,6 +104,9 @@ MODEL_NOTES = {
 LLM_CACHE: Dict[str, object] = {}
 AGENT_CACHE: Dict[Tuple[str, Tuple[str, ...]], object] = {}
 RUNTIME_HEALTH: Dict[str, str] = {}
+
+# Thread-local storage so each Gradio request can carry the real client IP
+_request_context = threading.local()
 
 
 # ============================================================
@@ -404,8 +408,10 @@ def generate_uuid(_: str = "") -> str:
 @tool
 def get_user_location(_: str = "") -> str:
     """Determine the user's approximate physical location based on their public IP address."""
+    client_ip = getattr(_request_context, "client_ip", "") or ""
+    url = f"http://ip-api.com/json/{client_ip}" if client_ip else "http://ip-api.com/json/"
     try:
-        response = requests.get("http://ip-api.com/json/", timeout=5)
+        response = requests.get(url, timeout=5)
         response.raise_for_status()
         data = response.json()
         if data.get("status") != "success":
@@ -578,8 +584,22 @@ def build_debug_report(
 # Run agent
 # ============================================================
 
-def run_agent(message, history, selected_tools, model_id):
+def _extract_client_ip(request: gr.Request) -> str:
+    """Return the real client IP, respecting reverse-proxy headers."""
+    headers = dict(request.headers or {})
+    for header in ("x-forwarded-for", "x-real-ip", "cf-connecting-ip"):
+        val = headers.get(header, "")
+        if val:
+            return val.split(",")[0].strip()
+    return getattr(request.client, "host", "") or ""
+
+
+def run_agent(message, history, selected_tools, model_id, request: gr.Request = None):
     history = history or []
+
+    # Capture the real client IP for get_user_location
+    if request is not None:
+        _request_context.client_ip = _extract_client_ip(request)
 
     if not message or not str(message).strip():
         return history, "No input provided.", "", None, model_status_text(model_id), "No input provided."
