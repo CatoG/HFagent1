@@ -1,5 +1,5 @@
 ---
-title: Math Knowledge Assistant
+title: Agent1
 emoji: 🧮
 colorFrom: blue
 colorTo: indigo
