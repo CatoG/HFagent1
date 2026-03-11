@@ -584,22 +584,11 @@ def build_debug_report(
 # Run agent
 # ============================================================
 
-def _extract_client_ip(request: gr.Request) -> str:
-    """Return the real client IP, respecting reverse-proxy headers."""
-    headers = dict(request.headers or {})
-    for header in ("x-forwarded-for", "x-real-ip", "cf-connecting-ip"):
-        val = headers.get(header, "")
-        if val:
-            return val.split(",")[0].strip()
-    return getattr(request.client, "host", "") or ""
-
-
-def run_agent(message, history, selected_tools, model_id, request: gr.Request = None):
+def run_agent(message, history, selected_tools, model_id, client_ip: str = ""):
     history = history or []
 
-    # Capture the real client IP for get_user_location
-    if request is not None:
-        _request_context.client_ip = _extract_client_ip(request)
+    # Store client IP in thread-local so get_user_location can read it
+    _request_context.client_ip = client_ip.strip() if client_ip else ""
 
     if not message or not str(message).strip():
         return history, "No input provided.", "", None, model_status_text(model_id), "No input provided."
@@ -744,6 +733,24 @@ with gr.Blocks(title="Provider Multi-Model Agent", theme=gr.themes.Soft()) as de
         interactive=False,
     )
 
+    # Populated by JavaScript on page load with the browser's real public IP
+    client_ip_box = gr.Textbox(visible=False, value="")
+
+    demo.load(
+        fn=None,
+        inputs=None,
+        outputs=[client_ip_box],
+        js="""async () => {
+            try {
+                const r = await fetch('https://api.ipify.org?format=json');
+                const d = await r.json();
+                return d.ip;
+            } catch(e) {
+                return '';
+            }
+        }""",
+    )
+
     model_dropdown.change(
         fn=model_status_text,
         inputs=[model_dropdown],
@@ -753,14 +760,14 @@ with gr.Blocks(title="Provider Multi-Model Agent", theme=gr.themes.Soft()) as de
 
     send_btn.click(
         fn=run_agent,
-        inputs=[user_input, chatbot, enabled_tools, model_dropdown],
+        inputs=[user_input, chatbot, enabled_tools, model_dropdown, client_ip_box],
         outputs=[chatbot, tool_trace, user_input, chart_output, model_status, debug_output],
         show_api=False,
     )
 
     user_input.submit(
         fn=run_agent,
-        inputs=[user_input, chatbot, enabled_tools, model_dropdown],
+        inputs=[user_input, chatbot, enabled_tools, model_dropdown, client_ip_box],
         outputs=[chatbot, tool_trace, user_input, chart_output, model_status, debug_output],
         show_api=False,
     )
