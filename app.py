@@ -407,8 +407,49 @@ def generate_uuid(_: str = "") -> str:
 
 @tool
 def get_user_location(_: str = "") -> str:
-    """Determine the user's approximate physical location based on their public IP address."""
-    client_ip = getattr(_request_context, "client_ip", "") or ""
+    """Determine the user's precise physical location using browser GPS/WiFi coordinates or IP fallback."""
+    location_data = getattr(_request_context, "client_ip", "") or ""
+
+    # Precise coordinates from browser geolocation API
+    if location_data and not location_data.startswith("ip:"):
+        try:
+            lat_str, lon_str = location_data.split(",", 1)
+            lat, lon = float(lat_str), float(lon_str)
+        except ValueError:
+            return "Location lookup failed: invalid coordinate data."
+        try:
+            headers = {"User-Agent": "HFAgent/1.0 (location lookup)"}
+            resp = requests.get(
+                "https://nominatim.openstreetmap.org/reverse",
+                params={"lat": lat, "lon": lon, "format": "json", "addressdetails": 1},
+                headers=headers,
+                timeout=8,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            addr = data.get("address", {})
+            city = (
+                addr.get("city")
+                or addr.get("town")
+                or addr.get("village")
+                or addr.get("municipality")
+                or addr.get("county")
+                or "N/A"
+            )
+            return (
+                f"City: {city}\n"
+                f"County: {addr.get('county', 'N/A')}\n"
+                f"Region: {addr.get('state', 'N/A')}\n"
+                f"Country: {addr.get('country', 'N/A')} ({addr.get('country_code', 'N/A').upper()})\n"
+                f"Latitude: {lat}\n"
+                f"Longitude: {lon}\n"
+                f"Source: Browser GPS/WiFi (precise)"
+            )
+        except requests.RequestException as exc:
+            return f"Reverse geocoding failed: {exc}"
+
+    # IP-based fallback
+    client_ip = location_data[3:] if location_data.startswith("ip:") else ""
     url = f"http://ip-api.com/json/{client_ip}" if client_ip else "http://ip-api.com/json/"
     try:
         response = requests.get(url, timeout=5)
@@ -423,7 +464,8 @@ def get_user_location(_: str = "") -> str:
             f"Latitude: {data.get('lat', 'N/A')}\n"
             f"Longitude: {data.get('lon', 'N/A')}\n"
             f"Timezone: {data.get('timezone', 'N/A')}\n"
-            f"ISP: {data.get('isp', 'N/A')}"
+            f"ISP: {data.get('isp', 'N/A')}\n"
+            f"Source: IP geolocation (approximate)"
         )
     except requests.RequestException as exc:
         return f"Location lookup failed: {exc}"
@@ -587,7 +629,7 @@ def build_debug_report(
 def run_agent(message, history, selected_tools, model_id, client_ip: str = ""):
     history = history or []
 
-    # Store client IP in thread-local so get_user_location can read it
+    # Store location data in thread-local so get_user_location can read it
     _request_context.client_ip = client_ip.strip() if client_ip else ""
 
     if not message or not str(message).strip():
@@ -733,7 +775,8 @@ with gr.Blocks(title="Provider Multi-Model Agent", theme=gr.themes.Soft()) as de
         interactive=False,
     )
 
-    # Populated by JavaScript on page load with the browser's real public IP
+    # Populated by JavaScript on page load with precise browser coordinates (GPS/WiFi),
+    # stored as "lat,lon". Falls back to the public IP via ipify if geolocation is denied.
     client_ip_box = gr.Textbox(visible=False, value="")
 
     demo.load(
@@ -741,13 +784,26 @@ with gr.Blocks(title="Provider Multi-Model Agent", theme=gr.themes.Soft()) as de
         inputs=None,
         outputs=[client_ip_box],
         js="""async () => {
-            try {
-                const r = await fetch('https://api.ipify.org?format=json');
-                const d = await r.json();
-                return d.ip;
-            } catch(e) {
-                return '';
-            }
+            return new Promise((resolve) => {
+                if (navigator.geolocation) {
+                    navigator.geolocation.getCurrentPosition(
+                        (pos) => resolve(pos.coords.latitude + ',' + pos.coords.longitude),
+                        async () => {
+                            try {
+                                const r = await fetch('https://api.ipify.org?format=json');
+                                const d = await r.json();
+                                resolve('ip:' + d.ip);
+                            } catch(e) { resolve(''); }
+                        },
+                        {timeout: 8000, maximumAge: 60000}
+                    );
+                } else {
+                    fetch('https://api.ipify.org?format=json')
+                        .then(r => r.json())
+                        .then(d => resolve('ip:' + d.ip))
+                        .catch(() => resolve(''));
+                }
+            });
         }""",
     )
 
