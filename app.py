@@ -6,7 +6,7 @@ import warnings
 import traceback
 from contextvars import ContextVar
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, TypedDict
 
 import requests
 from dotenv import load_dotenv
@@ -26,6 +26,7 @@ import matplotlib.pyplot as plt
 from huggingface_hub.errors import HfHubHTTPError
 
 from langchain_core.tools import tool
+from langchain_core.messages import SystemMessage, HumanMessage
 from langchain.agents import create_agent
 from langchain_community.utilities import WikipediaAPIWrapper, ArxivAPIWrapper
 from langchain_community.tools import DuckDuckGoSearchRun, ArxivQueryRun
@@ -495,6 +496,384 @@ TOOL_NAMES = list(ALL_TOOLS.keys())
 
 
 # ============================================================
+# Multi-role workflow — supervisor-style orchestration
+# ============================================================
+# Architecture:
+#   Planner → Specialist (Creative or Technical) → QA Tester → Planner review
+#   The Planner breaks the task, picks a specialist, and reviews QA feedback.
+#   If QA fails and retries remain, the Planner revises and loops again.
+#   If QA passes (or max retries are reached) the Planner approves a final answer.
+# ============================================================
+
+MAX_REVISIONS = 3  # Maximum QA-driven revision cycles before accepting best attempt
+
+
+class WorkflowState(TypedDict):
+    """Shared, inspectable state object threaded through the whole workflow."""
+    user_request: str
+    plan: str
+    current_role: str       # "creative" or "technical"
+    creative_output: str
+    technical_output: str
+    draft_output: str       # latest specialist output forwarded to QA
+    qa_report: str
+    qa_passed: bool
+    revision_count: int
+    final_answer: str
+
+
+# --- Role system prompts ---
+
+_PLANNER_SYSTEM = (
+    "You are the Planner in a multi-role AI workflow.\n"
+    "Your job is to:\n"
+    "1. Break the user's task into clear subtasks.\n"
+    "2. Decide which specialist to call: 'Creative Expert' (ideas, framing, wording)\n"
+    "   or 'Technical Expert' (code, architecture, implementation).\n"
+    "3. State clear success criteria.\n\n"
+    "Respond in this exact format:\n"
+    "TASK BREAKDOWN:\n<subtask list>\n\n"
+    "ROLE TO CALL: <Creative Expert | Technical Expert>\n\n"
+    "SUCCESS CRITERIA:\n<what a correct, complete answer looks like>\n\n"
+    "GUIDANCE FOR SPECIALIST:\n<any constraints or focus areas>"
+)
+
+_CREATIVE_SYSTEM = (
+    "You are the Creative Expert in a multi-role AI workflow.\n"
+    "You handle brainstorming, alternative ideas, framing, wording, and concept generation.\n\n"
+    "Respond in this exact format:\n"
+    "IDEAS:\n<list of ideas and alternatives>\n\n"
+    "RATIONALE:\n<why these are strong choices>\n\n"
+    "RECOMMENDED DRAFT:\n<the best draft output based on the ideas>"
+)
+
+_TECHNICAL_SYSTEM = (
+    "You are the Technical Expert in a multi-role AI workflow.\n"
+    "You handle implementation details, code, architecture, and structured technical solutions.\n\n"
+    "Respond in this exact format:\n"
+    "TECHNICAL APPROACH:\n<recommended approach>\n\n"
+    "IMPLEMENTATION NOTES:\n<key details, steps, and caveats>\n\n"
+    "FINAL TECHNICAL DRAFT:\n<the complete technical output or solution>"
+)
+
+_QA_SYSTEM = (
+    "You are the QA Tester in a multi-role AI workflow.\n"
+    "Check whether the specialist output satisfies the original request and success criteria.\n\n"
+    "Respond in this exact format:\n"
+    "REQUIREMENTS CHECKED:\n<list each requirement and whether it was met>\n\n"
+    "ISSUES FOUND:\n<defects or gaps — or 'None' if all requirements are met>\n\n"
+    "RESULT: <PASS | FAIL>\n\n"
+    "RECOMMENDED FIXES:\n<specific improvements — or 'None' if result is PASS>"
+)
+
+_PLANNER_REVIEW_SYSTEM = (
+    "You are the Planner reviewing QA feedback in a multi-role AI workflow.\n"
+    "Based on the QA report, either approve the result or plan a revision.\n\n"
+    "If QA PASSED, respond with:\n"
+    "DECISION: APPROVED\n"
+    "FINAL ANSWER:\n<the approved specialist output, reproduced in full>\n\n"
+    "If QA FAILED, respond with:\n"
+    "DECISION: REVISE\n"
+    "ROLE TO CALL: <Creative Expert | Technical Expert>\n"
+    "REVISED INSTRUCTIONS:\n<specific fixes the specialist must address>"
+)
+
+
+# --- Internal helpers ---
+
+def _llm_call(chat_model, system_prompt: str, user_content: str) -> str:
+    """Invoke the LLM with a role-specific system prompt. Returns plain text."""
+    response = chat_model.invoke([
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_content),
+    ])
+    return content_to_text(response.content)
+
+
+def _decide_role(text: str) -> str:
+    """Parse which specialist role the Planner wants to invoke.
+
+    Checks for the expected structured 'ROLE TO CALL:' format first,
+    then falls back to a word-boundary search for 'creative'.
+    Defaults to 'technical' when no clear signal is found.
+    """
+    # Prefer the explicit structured label produced by the Planner prompt
+    if "ROLE TO CALL: Creative Expert" in text:
+        return "creative"
+    if "ROLE TO CALL: Technical Expert" in text:
+        return "technical"
+    # Fallback: word-boundary match so 'creative' in 'not creative enough' still works,
+    # but avoids false hits from unrelated use of the word.
+    if re.search(r"\bcreative\b", text, re.IGNORECASE):
+        return "creative"
+    return "technical"
+
+
+def _qa_passed_check(qa_text: str) -> bool:
+    """Return True only if the QA report contains an explicit PASS result.
+
+    Relies on the structured 'RESULT: PASS / RESULT: FAIL' line produced by
+    the QA Tester prompt.  Returns False when the expected format is absent
+    to avoid false positives from words like 'bypass' or 'password'.
+    """
+    lower = qa_text.lower()
+    if "result: pass" in lower:
+        return True
+    if "result: fail" in lower:
+        return False
+    # No recognised verdict — treat as fail to avoid accepting a bad draft
+    return False
+
+
+# --- Workflow step functions ---
+# Each step receives the shared state and an append-only trace list,
+# updates state in place, appends log lines, and returns updated state.
+
+def _step_plan(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowState:
+    """Planner: analyse the task, produce a plan, decide which specialist to call."""
+    trace.append("\n╔══ [PLANNER] Analysing task... ══╗")
+    content = f"User request: {state['user_request']}"
+    if state["revision_count"] > 0:
+        content += (
+            f"\n\nThis is revision {state['revision_count']} of {MAX_REVISIONS}."
+            f"\nPrevious QA report:\n{state['qa_report']}"
+            "\nAdjust the plan to address the QA issues."
+        )
+    plan_text = _llm_call(chat_model, _PLANNER_SYSTEM, content)
+    state["plan"] = plan_text
+    state["current_role"] = _decide_role(plan_text)
+    trace.append(plan_text)
+    trace.append(f"╚══ [PLANNER] → routing to: {state['current_role'].upper()} EXPERT ══╝")
+    return state
+
+
+def _step_creative(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowState:
+    """Creative Expert: brainstorm ideas and produce a recommended draft."""
+    trace.append("\n╔══ [CREATIVE EXPERT] Generating ideas... ══╗")
+    content = (
+        f"User request: {state['user_request']}\n\n"
+        f"Planner instructions:\n{state['plan']}"
+    )
+    if state["revision_count"] > 0:
+        content += f"\n\nQA feedback to address:\n{state['qa_report']}"
+    text = _llm_call(chat_model, _CREATIVE_SYSTEM, content)
+    state["creative_output"] = text
+    state["draft_output"] = text
+    trace.append(text)
+    trace.append("╚══ [CREATIVE EXPERT] Done ══╝")
+    return state
+
+
+def _step_technical(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowState:
+    """Technical Expert: provide implementation details and a complete technical draft."""
+    trace.append("\n╔══ [TECHNICAL EXPERT] Working on implementation... ══╗")
+    content = (
+        f"User request: {state['user_request']}\n\n"
+        f"Planner instructions:\n{state['plan']}"
+    )
+    if state["revision_count"] > 0:
+        content += f"\n\nQA feedback to address:\n{state['qa_report']}"
+    text = _llm_call(chat_model, _TECHNICAL_SYSTEM, content)
+    state["technical_output"] = text
+    state["draft_output"] = text
+    trace.append(text)
+    trace.append("╚══ [TECHNICAL EXPERT] Done ══╝")
+    return state
+
+
+def _step_qa(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowState:
+    """QA Tester: check the draft against the original request and success criteria."""
+    trace.append("\n╔══ [QA TESTER] Reviewing output... ══╗")
+    content = (
+        f"Original user request: {state['user_request']}\n\n"
+        f"Planner's plan and success criteria:\n{state['plan']}\n\n"
+        f"Specialist output to review:\n{state['draft_output']}"
+    )
+    text = _llm_call(chat_model, _QA_SYSTEM, content)
+    state["qa_report"] = text
+    state["qa_passed"] = _qa_passed_check(text)
+    result_label = "✅ PASS" if state["qa_passed"] else "❌ FAIL"
+    trace.append(text)
+    trace.append(f"╚══ [QA TESTER] Result: {result_label} ══╝")
+    return state
+
+
+def _step_planner_review(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowState:
+    """Planner: review QA feedback and either approve the result or request a revision."""
+    trace.append("\n╔══ [PLANNER] Reviewing QA feedback... ══╗")
+    content = (
+        f"User request: {state['user_request']}\n\n"
+        f"Plan:\n{state['plan']}\n\n"
+        f"Specialist output:\n{state['draft_output']}\n\n"
+        f"QA report:\n{state['qa_report']}"
+    )
+    review = _llm_call(chat_model, _PLANNER_REVIEW_SYSTEM, content)
+    trace.append(review)
+
+    if "DECISION: APPROVED" in review.upper():
+        # Extract the final answer that the Planner reproduced in full
+        parts = review.split("FINAL ANSWER:", 1)
+        if len(parts) > 1:
+            state["final_answer"] = parts[1].strip()
+        else:
+            # Planner approved but omitted the expected FINAL ANSWER section — use draft
+            trace.append("  ⚠ FINAL ANSWER section missing; using specialist draft as final answer.")
+            state["final_answer"] = state["draft_output"]
+        trace.append("╚══ [PLANNER] → ✅ APPROVED ══╝")
+    else:
+        # Planner requests a revision — update plan with revised instructions
+        parts = review.split("REVISED INSTRUCTIONS:", 1)
+        if len(parts) > 1:
+            state["plan"] = parts[1].strip()
+        else:
+            # Revision requested but REVISED INSTRUCTIONS section missing — keep current plan
+            trace.append("  ⚠ REVISED INSTRUCTIONS section missing; retrying with existing plan.")
+        state["current_role"] = _decide_role(review)
+        trace.append(
+            f"╚══ [PLANNER] → 🔄 REVISE — routing to {state['current_role'].upper()} EXPERT ══╝"
+        )
+    return state
+
+
+# --- Specialist role tools ---
+# These wrap the step functions as @tool so the Planner (or any LangChain agent)
+# can invoke specialists in a standard tool-use pattern.
+
+# Holds the active model ID for standalone specialist tool calls.
+_workflow_model_id: str = DEFAULT_MODEL_ID
+
+
+@tool
+def call_creative_expert(task: str) -> str:
+    """Call the Creative Expert to brainstorm ideas, framing, and produce a draft for a given task."""
+    chat = build_provider_chat(_workflow_model_id)
+    state: WorkflowState = {
+        "user_request": task, "plan": task, "current_role": "creative",
+        "creative_output": "", "technical_output": "", "draft_output": "",
+        "qa_report": "", "qa_passed": False, "revision_count": 0, "final_answer": "",
+    }
+    state = _step_creative(chat, state, [])
+    return state["creative_output"]
+
+
+@tool
+def call_technical_expert(task: str) -> str:
+    """Call the Technical Expert to produce implementation details and a solution for a given task."""
+    chat = build_provider_chat(_workflow_model_id)
+    state: WorkflowState = {
+        "user_request": task, "plan": task, "current_role": "technical",
+        "creative_output": "", "technical_output": "", "draft_output": "",
+        "qa_report": "", "qa_passed": False, "revision_count": 0, "final_answer": "",
+    }
+    state = _step_technical(chat, state, [])
+    return state["technical_output"]
+
+
+@tool
+def call_qa_tester(task_and_output: str) -> str:
+    """Call the QA Tester to review specialist output against requirements.
+    Input format: 'TASK: <description>\nOUTPUT: <specialist output to review>'"""
+    chat = build_provider_chat(_workflow_model_id)
+    if "OUTPUT:" in task_and_output:
+        parts = task_and_output.split("OUTPUT:", 1)
+        task = parts[0].replace("TASK:", "").strip()
+        output = parts[1].strip()
+    else:
+        task = task_and_output
+        output = task_and_output
+    # current_role is left empty — this is a standalone QA call outside the normal loop
+    state: WorkflowState = {
+        "user_request": task, "plan": task, "current_role": "",
+        "creative_output": "", "technical_output": "", "draft_output": output,
+        "qa_report": "", "qa_passed": False, "revision_count": 0, "final_answer": "",
+    }
+    state = _step_qa(chat, state, [])
+    return state["qa_report"]
+
+
+# --- Orchestration loop ---
+
+def run_multi_role_workflow(message: str, model_id: str) -> Tuple[str, str]:
+    """Run the supervisor-style multi-role workflow.
+
+    Flow:
+      1. Planner analyses the task and picks a specialist.
+      2. Specialist (Creative or Technical) generates output.
+      3. QA Tester reviews the output.
+      4. Planner reviews QA result and either approves or requests a revision.
+      5. Repeat from step 2 if QA fails and retries remain.
+      6. If max retries are reached, return best attempt with QA concerns.
+
+    Returns:
+        (final_answer, workflow_trace_text)
+    """
+    global _workflow_model_id
+    _workflow_model_id = model_id
+    chat_model = build_provider_chat(model_id)
+
+    state: WorkflowState = {
+        "user_request": message,
+        "plan": "",
+        "current_role": "",
+        "creative_output": "",
+        "technical_output": "",
+        "draft_output": "",
+        "qa_report": "",
+        "qa_passed": False,
+        "revision_count": 0,
+        "final_answer": "",
+    }
+
+    trace: List[str] = [
+        "═══ MULTI-ROLE WORKFLOW STARTED ═══",
+        f"Model   : {model_id}",
+        f"Request : {message}",
+        f"Max revisions: {MAX_REVISIONS}",
+    ]
+
+    try:
+        # Step 1: Planner creates the initial plan
+        state = _step_plan(chat_model, state, trace)
+
+        # Orchestration loop: specialist → QA → Planner review → revise if needed
+        while True:
+            # Step 2: invoke the chosen specialist
+            if state["current_role"] == "creative":
+                state = _step_creative(chat_model, state, trace)
+            else:
+                state = _step_technical(chat_model, state, trace)
+
+            # Step 3: QA reviews the specialist's draft
+            state = _step_qa(chat_model, state, trace)
+
+            # Step 4: Planner reviews the QA result
+            state = _step_planner_review(chat_model, state, trace)
+
+            # Exit if the Planner approved the result
+            if state["final_answer"]:
+                trace.append("\n═══ WORKFLOW COMPLETE — APPROVED ═══")
+                break
+
+            # Increment revision counter and enforce the retry limit
+            state["revision_count"] += 1
+            if state["revision_count"] >= MAX_REVISIONS:
+                state["final_answer"] = state["draft_output"]
+                trace.append(
+                    f"\n═══ MAX REVISIONS REACHED ({MAX_REVISIONS}) ═══\n"
+                    f"Returning best attempt. Outstanding QA concerns:\n{state['qa_report']}"
+                )
+                break
+
+            trace.append(f"\n═══ REVISION {state['revision_count']} / {MAX_REVISIONS} ═══")
+
+    except Exception as exc:
+        trace.append(f"\n[ERROR] {exc}\n{traceback.format_exc()}")
+        state["final_answer"] = state["draft_output"] or f"Workflow error: {exc}"
+
+    return state["final_answer"], "\n".join(trace)
+
+
+# ============================================================
 # Agent builder
 # ============================================================
 
@@ -732,121 +1111,189 @@ with gr.Blocks(title="LLM + Agent tools demo", theme=gr.themes.Soft()) as demo:
         "with selectable tools and extended debugging."
     )
 
-    with gr.Row():
-        model_dropdown = gr.Dropdown(
-            choices=MODEL_OPTIONS,
-            value=DEFAULT_MODEL_ID,
-            label="Base model",
-        )
-        model_status = gr.Textbox(
-            value=model_status_text(DEFAULT_MODEL_ID),
-            label="Model status",
-            interactive=False,
-        )
+    with gr.Tabs():
 
-    with gr.Row():
-        with gr.Column(scale=3):
-            chatbot = gr.Chatbot(label="Conversation", height=460, type="messages")
-            user_input = gr.Textbox(
-                label="Message",
-                placeholder="Ask anything...",
-            )
-
+        # ── Tab 1: existing single-agent demo (unchanged) ──────────────────
+        with gr.Tab("Agent Demo"):
             with gr.Row():
-                send_btn = gr.Button("Send", variant="primary")
-                clear_btn = gr.Button("Clear")
-
-            chart_output = gr.Image(label="Generated chart", type="filepath")
-
-            with gr.Row():
-                location_btn = gr.Button("📍 Share my location", size="sm")
-                location_status = gr.Textbox(
-                    value="Location not set — click the button above before asking 'where am I'",
-                    label="Location status",
+                model_dropdown = gr.Dropdown(
+                    choices=MODEL_OPTIONS,
+                    value=DEFAULT_MODEL_ID,
+                    label="Base model",
+                )
+                model_status = gr.Textbox(
+                    value=model_status_text(DEFAULT_MODEL_ID),
+                    label="Model status",
                     interactive=False,
-                    max_lines=1,
                 )
 
-        with gr.Column(scale=1):
-            enabled_tools = gr.CheckboxGroup(
-                choices=TOOL_NAMES,
-                value=TOOL_NAMES,
-                label="Enabled tools",
-            )
-            tool_trace = gr.Textbox(
-                label="Tool trace",
-                lines=18,
+            with gr.Row():
+                with gr.Column(scale=3):
+                    chatbot = gr.Chatbot(label="Conversation", height=460, type="messages")
+                    user_input = gr.Textbox(
+                        label="Message",
+                        placeholder="Ask anything...",
+                    )
+
+                    with gr.Row():
+                        send_btn = gr.Button("Send", variant="primary")
+                        clear_btn = gr.Button("Clear")
+
+                    chart_output = gr.Image(label="Generated chart", type="filepath")
+
+                    with gr.Row():
+                        location_btn = gr.Button("📍 Share my location", size="sm")
+                        location_status = gr.Textbox(
+                            value="Location not set — click the button above before asking 'where am I'",
+                            label="Location status",
+                            interactive=False,
+                            max_lines=1,
+                        )
+
+                with gr.Column(scale=1):
+                    enabled_tools = gr.CheckboxGroup(
+                        choices=TOOL_NAMES,
+                        value=TOOL_NAMES,
+                        label="Enabled tools",
+                    )
+                    tool_trace = gr.Textbox(
+                        label="Tool trace",
+                        lines=18,
+                        interactive=False,
+                    )
+
+            debug_output = gr.Textbox(
+                label="Debug output",
+                lines=28,
                 interactive=False,
             )
 
-    debug_output = gr.Textbox(
-        label="Debug output",
-        lines=28,
-        interactive=False,
-    )
+            # Hidden: holds "lat,lon" or "ip:<address>" set by the location button
+            client_ip_box = gr.Textbox(visible=False, value="")
 
-    # Hidden: holds "lat,lon" or "ip:<address>" set by the location button
-    client_ip_box = gr.Textbox(visible=False, value="")
+            model_dropdown.change(
+                fn=model_status_text,
+                inputs=[model_dropdown],
+                outputs=[model_status],
+                show_api=False,
+            )
 
-    model_dropdown.change(
-        fn=model_status_text,
-        inputs=[model_dropdown],
-        outputs=[model_status],
-        show_api=False,
-    )
+            # Geolocation button: JS runs in the browser, result goes to hidden box + status label
+            location_btn.click(
+                fn=None,
+                inputs=None,
+                outputs=[client_ip_box, location_status],
+                js="""async () => {
+                    return new Promise((resolve) => {
+                        const fallback = async () => {
+                            try {
+                                const r = await fetch('https://api.ipify.org?format=json');
+                                const d = await r.json();
+                                resolve(['ip:' + d.ip, 'Location: IP-based fallback (approximate)']);
+                            } catch(e) {
+                                resolve(['', 'Location detection failed.']);
+                            }
+                        };
+                        if (!navigator.geolocation) { fallback(); return; }
+                        navigator.geolocation.getCurrentPosition(
+                            (pos) => {
+                                const lat = pos.coords.latitude.toFixed(5);
+                                const lon = pos.coords.longitude.toFixed(5);
+                                const acc = Math.round(pos.coords.accuracy);
+                                resolve([lat + ',' + lon, `\u2705 GPS/WiFi location set (\u00b1${acc}m)`]);
+                            },
+                            fallback,
+                            {timeout: 10000, maximumAge: 60000, enableHighAccuracy: true}
+                        );
+                    });
+                }""",
+                show_api=False,
+            )
 
-    # Geolocation button: JS runs in the browser, result goes to hidden box + status label
-    location_btn.click(
-        fn=None,
-        inputs=None,
-        outputs=[client_ip_box, location_status],
-        js="""async () => {
-            return new Promise((resolve) => {
-                const fallback = async () => {
-                    try {
-                        const r = await fetch('https://api.ipify.org?format=json');
-                        const d = await r.json();
-                        resolve(['ip:' + d.ip, 'Location: IP-based fallback (approximate)']);
-                    } catch(e) {
-                        resolve(['', 'Location detection failed.']);
-                    }
-                };
-                if (!navigator.geolocation) { fallback(); return; }
-                navigator.geolocation.getCurrentPosition(
-                    (pos) => {
-                        const lat = pos.coords.latitude.toFixed(5);
-                        const lon = pos.coords.longitude.toFixed(5);
-                        const acc = Math.round(pos.coords.accuracy);
-                        resolve([lat + ',' + lon, `\u2705 GPS/WiFi location set (\u00b1${acc}m)`]);
-                    },
-                    fallback,
-                    {timeout: 10000, maximumAge: 60000, enableHighAccuracy: true}
-                );
-            });
-        }""",
-        show_api=False,
-    )
+            send_btn.click(
+                fn=run_agent,
+                inputs=[user_input, chatbot, enabled_tools, model_dropdown, client_ip_box],
+                outputs=[chatbot, tool_trace, user_input, chart_output, model_status, debug_output],
+                show_api=False,
+            )
 
-    send_btn.click(
-        fn=run_agent,
-        inputs=[user_input, chatbot, enabled_tools, model_dropdown, client_ip_box],
-        outputs=[chatbot, tool_trace, user_input, chart_output, model_status, debug_output],
-        show_api=False,
-    )
+            user_input.submit(
+                fn=run_agent,
+                inputs=[user_input, chatbot, enabled_tools, model_dropdown, client_ip_box],
+                outputs=[chatbot, tool_trace, user_input, chart_output, model_status, debug_output],
+                show_api=False,
+            )
 
-    user_input.submit(
-        fn=run_agent,
-        inputs=[user_input, chatbot, enabled_tools, model_dropdown, client_ip_box],
-        outputs=[chatbot, tool_trace, user_input, chart_output, model_status, debug_output],
-        show_api=False,
-    )
+            clear_btn.click(
+                fn=lambda model_id: ([], "", "", None, model_status_text(model_id), ""),
+                inputs=[model_dropdown],
+                outputs=[chatbot, tool_trace, user_input, chart_output, model_status, debug_output],
+                show_api=False,
+            )
 
-    clear_btn.click(
-        fn=lambda model_id: ([], "", "", None, model_status_text(model_id), ""),
-        inputs=[model_dropdown],
-        outputs=[chatbot, tool_trace, user_input, chart_output, model_status, debug_output],
-        show_api=False,
-    )
+        # ── Tab 2: multi-role workflow demo ────────────────────────────────
+        with gr.Tab("Multi-Role Workflow"):
+            gr.Markdown(
+                "## Supervisor-style Multi-Role Workflow\n"
+                "**Planner** → **Specialist** (Creative or Technical) → **QA Tester** → **Planner review**\n\n"
+                "The Planner breaks the task, picks the right specialist, and reviews QA feedback. "
+                f"If QA fails, the loop repeats up to **{MAX_REVISIONS}** times before accepting the best attempt."
+            )
+
+            with gr.Row():
+                wf_model_dropdown = gr.Dropdown(
+                    choices=MODEL_OPTIONS,
+                    value=DEFAULT_MODEL_ID,
+                    label="Model",
+                )
+
+            wf_input = gr.Textbox(
+                label="Task / Request",
+                placeholder=(
+                    "Describe what you want the multi-role team to work on…\n"
+                    "e.g. 'Write a short blog post about the benefits of open-source AI'"
+                ),
+                lines=3,
+            )
+            wf_submit_btn = gr.Button("▶ Run Multi-Role Workflow", variant="primary")
+
+            with gr.Row():
+                with gr.Column(scale=2):
+                    wf_answer = gr.Textbox(
+                        label="✅ Final Answer (Planner approved)",
+                        lines=14,
+                        interactive=False,
+                    )
+                with gr.Column(scale=3):
+                    wf_trace = gr.Textbox(
+                        label="Workflow Trace — role-by-role log",
+                        lines=28,
+                        interactive=False,
+                    )
+
+            def _run_workflow_ui(message: str, model_id: str) -> Tuple[str, str]:
+                """Gradio handler: validate input, run the workflow, return outputs."""
+                if not message or not message.strip():
+                    return "No input provided.", ""
+                try:
+                    final_answer, trace = run_multi_role_workflow(message.strip(), model_id)
+                    return final_answer, trace
+                except Exception as exc:
+                    return f"Workflow error: {exc}", traceback.format_exc()
+
+            wf_submit_btn.click(
+                fn=_run_workflow_ui,
+                inputs=[wf_input, wf_model_dropdown],
+                outputs=[wf_answer, wf_trace],
+                show_api=False,
+            )
+
+            wf_input.submit(
+                fn=_run_workflow_ui,
+                inputs=[wf_input, wf_model_dropdown],
+                outputs=[wf_answer, wf_trace],
+                show_api=False,
+            )
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
