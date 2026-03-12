@@ -515,6 +515,9 @@ AGENT_ROLES = {
     "research": "Research Analyst",
     "security": "Security Reviewer",
     "data_analyst": "Data Analyst",
+    "mad_professor": "Mad Professor",
+    "accountant": "Accountant",
+    "artist": "Artist",
 }
 # Reverse mapping: display label → role key
 _ROLE_LABEL_TO_KEY = {v: k for k, v in AGENT_ROLES.items()}
@@ -524,12 +527,15 @@ class WorkflowState(TypedDict):
     """Shared, inspectable state object threaded through the whole workflow."""
     user_request: str
     plan: str
-    current_role: str       # "creative", "technical", "research", "security", or "data_analyst"
+    current_role: str       # key from AGENT_ROLES (e.g. "creative", "technical", "mad_professor")
     creative_output: str
     technical_output: str
     research_output: str
     security_output: str
     data_analyst_output: str
+    mad_professor_output: str
+    accountant_output: str
+    artist_output: str
     draft_output: str       # latest specialist output forwarded to QA
     qa_report: str
     qa_passed: bool
@@ -549,10 +555,13 @@ _PLANNER_SYSTEM = (
     "   - 'Research Analyst' (information gathering, literature review, fact-finding)\n"
     "   - 'Security Reviewer' (security analysis, vulnerability checks, best practices)\n"
     "   - 'Data Analyst' (data analysis, statistics, pattern recognition, insights)\n"
+    "   - 'Mad Professor' (radical scientific hypotheses, unhinged groundbreaking theories, extreme scientific speculation)\n"
+    "   - 'Accountant' (extreme cost scrutiny, ruthless cost-cutting, cheapest alternatives regardless of quality)\n"
+    "   - 'Artist' (wildly unhinged creative vision, cosmic feeling and vibes, impractical but spectacular ideas)\n"
     "3. State clear success criteria.\n\n"
     "Respond in this exact format:\n"
     "TASK BREAKDOWN:\n<subtask list>\n\n"
-    "ROLE TO CALL: <Creative Expert | Technical Expert | Research Analyst | Security Reviewer | Data Analyst>\n\n"
+    "ROLE TO CALL: <Creative Expert | Technical Expert | Research Analyst | Security Reviewer | Data Analyst | Mad Professor | Accountant | Artist>\n\n"
     "SUCCESS CRITERIA:\n<what a correct, complete answer looks like>\n\n"
     "GUIDANCE FOR SPECIALIST:\n<any constraints or focus areas>"
 )
@@ -593,7 +602,7 @@ _PLANNER_REVIEW_SYSTEM = (
     "FINAL ANSWER:\n<the approved specialist output, reproduced in full>\n\n"
     "If QA FAILED, respond with:\n"
     "DECISION: REVISE\n"
-    "ROLE TO CALL: <Creative Expert | Technical Expert | Research Analyst | Security Reviewer | Data Analyst>\n"
+    "ROLE TO CALL: <Creative Expert | Technical Expert | Research Analyst | Security Reviewer | Data Analyst | Mad Professor | Accountant | Artist>\n"
     "REVISED INSTRUCTIONS:\n<specific fixes the specialist must address>"
 )
 
@@ -626,6 +635,44 @@ _DATA_ANALYST_SYSTEM = (
     "ANALYTICAL DRAFT:\n<the complete analytical output or solution>"
 )
 
+_MAD_PROFESSOR_SYSTEM = (
+    "You are the Mad Professor in a multi-role AI workflow.\n"
+    "You are an unhinged scientific visionary who pushes theories to the absolute extreme.\n"
+    "You propose radical, groundbreaking, and outlandish scientific hypotheses with total conviction.\n"
+    "You ignore convention, laugh at 'impossible', and speculate wildly about paradigm-shattering discoveries.\n"
+    "Cost, practicality, and peer review are irrelevant — only the science matters, and the more extreme the better.\n\n"
+    "Respond in this exact format:\n"
+    "WILD HYPOTHESIS:\n<the most extreme, unhinged scientific theory relevant to the task>\n\n"
+    "SCIENTIFIC RATIONALE:\n<fringe evidence, speculative mechanisms, and radical extrapolations that 'support' the hypothesis>\n\n"
+    "GROUNDBREAKING IMPLICATIONS:\n<what this revolutionary theory changes about everything we know>\n\n"
+    "MAD SCIENCE DRAFT:\n<the complete output driven by this radical scientific lens>"
+)
+
+_ACCOUNTANT_SYSTEM = (
+    "You are the Accountant in a multi-role AI workflow.\n"
+    "You are obsessively, ruthlessly focused on minimising costs above all else.\n"
+    "You question every expense, demand the cheapest possible alternative for everything, and treat cost reduction as the supreme priority — regardless of quality, user experience, or outcome.\n"
+    "You view every suggestion through the lens of 'can this be done cheaper?' and the answer is always yes.\n\n"
+    "Respond in this exact format:\n"
+    "COST ANALYSIS:\n<breakdown of every cost element and how outrageously expensive it is>\n\n"
+    "COST-CUTTING MEASURES:\n<extreme measures to eliminate or slash each cost, including free/DIY alternatives>\n\n"
+    "CHEAPEST VIABLE APPROACH:\n<the absolute rock-bottom solution that technically meets the minimum requirement>\n\n"
+    "BUDGET DRAFT:\n<the complete output optimised exclusively for minimum cost>"
+)
+
+_ARTIST_SYSTEM = (
+    "You are the Artist in a multi-role AI workflow.\n"
+    "You are a wildly unhinged creative visionary who operates on pure feeling, cosmic energy, and unbounded imagination.\n"
+    "You propose ideas so creatively extreme that they transcend practicality, cost, and conventional logic entirely.\n"
+    "You think in metaphors, sensations, dreams, and universal vibrations. Implementation is someone else's problem.\n"
+    "The more otherworldly, poetic, and mind-expanding the idea, the better.\n\n"
+    "Respond in this exact format:\n"
+    "COSMIC VISION:\n<the wildest, most unhinged creative concept imaginable for this task>\n\n"
+    "FEELING AND VIBES:\n<the emotional energy, sensory experience, and cosmic resonance this idea evokes>\n\n"
+    "WILD STORM OF IDEAS:\n<a torrent of unfiltered, boundary-breaking creative ideas, each more extreme than the last>\n\n"
+    "ARTISTIC DRAFT:\n<the complete output channelled through pure creative and cosmic inspiration>"
+)
+
 
 # --- Internal helpers ---
 
@@ -656,6 +703,12 @@ def _decide_role(text: str) -> str:
         return "security"
     if "ROLE TO CALL: Data Analyst" in text:
         return "data_analyst"
+    if "ROLE TO CALL: Mad Professor" in text:
+        return "mad_professor"
+    if "ROLE TO CALL: Accountant" in text:
+        return "accountant"
+    if "ROLE TO CALL: Artist" in text:
+        return "artist"
     # Fallback: word-boundary match
     if re.search(r"\bcreative\b", text, re.IGNORECASE):
         return "creative"
@@ -665,6 +718,12 @@ def _decide_role(text: str) -> str:
         return "security"
     if re.search(r"\bdata\s+analyst\b", text, re.IGNORECASE):
         return "data_analyst"
+    if re.search(r"\bmad\s+professor\b", text, re.IGNORECASE):
+        return "mad_professor"
+    if re.search(r"\baccountant\b", text, re.IGNORECASE):
+        return "accountant"
+    if re.search(r"\bartist\b", text, re.IGNORECASE):
+        return "artist"
     return "technical"
 
 
@@ -845,6 +904,57 @@ def _step_data_analyst(chat_model, state: WorkflowState, trace: List[str]) -> Wo
     return state
 
 
+def _step_mad_professor(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowState:
+    """Mad Professor: propose radical, unhinged scientific theories and extreme hypotheses."""
+    trace.append("\n╔══ [MAD PROFESSOR] Unleashing radical scientific theories... ══╗")
+    content = (
+        f"User request: {state['user_request']}\n\n"
+        f"Planner instructions:\n{state['plan']}"
+    )
+    if state["revision_count"] > 0:
+        content += f"\n\nQA feedback to address:\n{state['qa_report']}"
+    text = _llm_call(chat_model, _MAD_PROFESSOR_SYSTEM, content)
+    state["mad_professor_output"] = text
+    state["draft_output"] = text
+    trace.append(text)
+    trace.append("╚══ [MAD PROFESSOR] Done ══╝")
+    return state
+
+
+def _step_accountant(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowState:
+    """Accountant: ruthlessly cut costs and find the cheapest possible approach."""
+    trace.append("\n╔══ [ACCOUNTANT] Auditing every cost... ══╗")
+    content = (
+        f"User request: {state['user_request']}\n\n"
+        f"Planner instructions:\n{state['plan']}"
+    )
+    if state["revision_count"] > 0:
+        content += f"\n\nQA feedback to address:\n{state['qa_report']}"
+    text = _llm_call(chat_model, _ACCOUNTANT_SYSTEM, content)
+    state["accountant_output"] = text
+    state["draft_output"] = text
+    trace.append(text)
+    trace.append("╚══ [ACCOUNTANT] Done ══╝")
+    return state
+
+
+def _step_artist(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowState:
+    """Artist: channel cosmic creative energy into wildly unhinged and spectacular ideas."""
+    trace.append("\n╔══ [ARTIST] Channelling cosmic creative energy... ══╗")
+    content = (
+        f"User request: {state['user_request']}\n\n"
+        f"Planner instructions:\n{state['plan']}"
+    )
+    if state["revision_count"] > 0:
+        content += f"\n\nQA feedback to address:\n{state['qa_report']}"
+    text = _llm_call(chat_model, _ARTIST_SYSTEM, content)
+    state["artist_output"] = text
+    state["draft_output"] = text
+    trace.append(text)
+    trace.append("╚══ [ARTIST] Done ══╝")
+    return state
+
+
 # Mapping from role key → step function, used by the orchestration loop
 _SPECIALIST_STEPS = {
     "creative": _step_creative,
@@ -852,6 +962,9 @@ _SPECIALIST_STEPS = {
     "research": _step_research,
     "security": _step_security,
     "data_analyst": _step_data_analyst,
+    "mad_professor": _step_mad_professor,
+    "accountant": _step_accountant,
+    "artist": _step_artist,
 }
 
 
@@ -866,6 +979,7 @@ _EMPTY_STATE_BASE: WorkflowState = {
     "user_request": "", "plan": "", "current_role": "",
     "creative_output": "", "technical_output": "",
     "research_output": "", "security_output": "", "data_analyst_output": "",
+    "mad_professor_output": "", "accountant_output": "", "artist_output": "",
     "draft_output": "", "qa_report": "", "qa_passed": False,
     "revision_count": 0, "final_answer": "",
 }
@@ -934,6 +1048,33 @@ def call_data_analyst(task: str) -> str:
     return state["data_analyst_output"]
 
 
+@tool
+def call_mad_professor(task: str) -> str:
+    """Call the Mad Professor to generate radical, unhinged scientific theories and extreme groundbreaking hypotheses for a given task."""
+    chat = build_provider_chat(_workflow_model_id)
+    state: WorkflowState = {**_EMPTY_STATE_BASE, "user_request": task, "plan": task, "current_role": "mad_professor"}
+    state = _step_mad_professor(chat, state, [])
+    return state["mad_professor_output"]
+
+
+@tool
+def call_accountant(task: str) -> str:
+    """Call the Accountant to ruthlessly analyse and cut costs, finding the cheapest possible approach regardless of quality."""
+    chat = build_provider_chat(_workflow_model_id)
+    state: WorkflowState = {**_EMPTY_STATE_BASE, "user_request": task, "plan": task, "current_role": "accountant"}
+    state = _step_accountant(chat, state, [])
+    return state["accountant_output"]
+
+
+@tool
+def call_artist(task: str) -> str:
+    """Call the Artist to channel cosmic creative energy into wildly unhinged and spectacular ideas without concern for cost or practicality."""
+    chat = build_provider_chat(_workflow_model_id)
+    state: WorkflowState = {**_EMPTY_STATE_BASE, "user_request": task, "plan": task, "current_role": "artist"}
+    state = _step_artist(chat, state, [])
+    return state["artist_output"]
+
+
 # --- Orchestration loop ---
 
 def run_multi_role_workflow(
@@ -970,7 +1111,7 @@ def run_multi_role_workflow(
     active_keys = {_ROLE_LABEL_TO_KEY[lbl] for lbl in active_role_labels if lbl in _ROLE_LABEL_TO_KEY}
 
     # Determine which specialist keys are active (ordered list for deterministic fallback)
-    all_specialist_keys = ["creative", "technical", "research", "security", "data_analyst"]
+    all_specialist_keys = ["creative", "technical", "research", "security", "data_analyst", "mad_professor", "accountant", "artist"]
     active_specialist_keys = [k for k in all_specialist_keys if k in active_keys]
 
     planner_active = "planner" in active_keys
@@ -988,6 +1129,9 @@ def run_multi_role_workflow(
         "research_output": "",
         "security_output": "",
         "data_analyst_output": "",
+        "mad_professor_output": "",
+        "accountant_output": "",
+        "artist_output": "",
         "draft_output": "",
         "qa_report": "",
         "qa_passed": False,
