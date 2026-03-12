@@ -507,14 +507,29 @@ TOOL_NAMES = list(ALL_TOOLS.keys())
 
 MAX_REVISIONS = 3  # Maximum QA-driven revision cycles before accepting best attempt
 
+AGENT_ROLES = {
+    "planner": "Planner",
+    "creative": "Creative Expert",
+    "technical": "Technical Expert",
+    "qa_tester": "QA Tester",
+    "research": "Research Analyst",
+    "security": "Security Reviewer",
+    "data_analyst": "Data Analyst",
+}
+# Reverse mapping: display label → role key
+_ROLE_LABEL_TO_KEY = {v: k for k, v in AGENT_ROLES.items()}
+
 
 class WorkflowState(TypedDict):
     """Shared, inspectable state object threaded through the whole workflow."""
     user_request: str
     plan: str
-    current_role: str       # "creative" or "technical"
+    current_role: str       # "creative", "technical", "research", "security", or "data_analyst"
     creative_output: str
     technical_output: str
+    research_output: str
+    security_output: str
+    data_analyst_output: str
     draft_output: str       # latest specialist output forwarded to QA
     qa_report: str
     qa_passed: bool
@@ -528,12 +543,16 @@ _PLANNER_SYSTEM = (
     "You are the Planner in a multi-role AI workflow.\n"
     "Your job is to:\n"
     "1. Break the user's task into clear subtasks.\n"
-    "2. Decide which specialist to call: 'Creative Expert' (ideas, framing, wording)\n"
-    "   or 'Technical Expert' (code, architecture, implementation).\n"
+    "2. Decide which specialist to call:\n"
+    "   - 'Creative Expert' (ideas, framing, wording, brainstorming)\n"
+    "   - 'Technical Expert' (code, architecture, implementation)\n"
+    "   - 'Research Analyst' (information gathering, literature review, fact-finding)\n"
+    "   - 'Security Reviewer' (security analysis, vulnerability checks, best practices)\n"
+    "   - 'Data Analyst' (data analysis, statistics, pattern recognition, insights)\n"
     "3. State clear success criteria.\n\n"
     "Respond in this exact format:\n"
     "TASK BREAKDOWN:\n<subtask list>\n\n"
-    "ROLE TO CALL: <Creative Expert | Technical Expert>\n\n"
+    "ROLE TO CALL: <Creative Expert | Technical Expert | Research Analyst | Security Reviewer | Data Analyst>\n\n"
     "SUCCESS CRITERIA:\n<what a correct, complete answer looks like>\n\n"
     "GUIDANCE FOR SPECIALIST:\n<any constraints or focus areas>"
 )
@@ -574,8 +593,37 @@ _PLANNER_REVIEW_SYSTEM = (
     "FINAL ANSWER:\n<the approved specialist output, reproduced in full>\n\n"
     "If QA FAILED, respond with:\n"
     "DECISION: REVISE\n"
-    "ROLE TO CALL: <Creative Expert | Technical Expert>\n"
+    "ROLE TO CALL: <Creative Expert | Technical Expert | Research Analyst | Security Reviewer | Data Analyst>\n"
     "REVISED INSTRUCTIONS:\n<specific fixes the specialist must address>"
+)
+
+_RESEARCH_SYSTEM = (
+    "You are the Research Analyst in a multi-role AI workflow.\n"
+    "You gather information, review existing literature, and summarize facts relevant to the task.\n\n"
+    "Respond in this exact format:\n"
+    "SOURCES CONSULTED:\n<list of sources, references, or knowledge domains used>\n\n"
+    "KEY FINDINGS:\n<factual information gathered and synthesized>\n\n"
+    "RESEARCH SUMMARY:\n<a comprehensive summary of findings relevant to the request>"
+)
+
+_SECURITY_SYSTEM = (
+    "You are the Security Reviewer in a multi-role AI workflow.\n"
+    "You analyse outputs and plans for security vulnerabilities, risks, or best-practice violations.\n\n"
+    "Respond in this exact format:\n"
+    "SECURITY ANALYSIS:\n<identification of potential security concerns or risks>\n\n"
+    "VULNERABILITIES FOUND:\n<specific vulnerabilities or risks — or 'None' if the output is secure>\n\n"
+    "RECOMMENDATIONS:\n<specific security improvements and mitigations>\n\n"
+    "REVIEWED OUTPUT:\n<the specialist output revised to address security concerns>"
+)
+
+_DATA_ANALYST_SYSTEM = (
+    "You are the Data Analyst in a multi-role AI workflow.\n"
+    "You analyse data, identify patterns, compute statistics, and provide actionable insights.\n\n"
+    "Respond in this exact format:\n"
+    "DATA OVERVIEW:\n<description of the data or problem being analysed>\n\n"
+    "ANALYSIS:\n<key patterns, statistics, or calculations>\n\n"
+    "INSIGHTS:\n<actionable conclusions drawn from the analysis>\n\n"
+    "ANALYTICAL DRAFT:\n<the complete analytical output or solution>"
 )
 
 
@@ -594,7 +642,7 @@ def _decide_role(text: str) -> str:
     """Parse which specialist role the Planner wants to invoke.
 
     Checks for the expected structured 'ROLE TO CALL:' format first,
-    then falls back to a word-boundary search for 'creative'.
+    then falls back to a word-boundary search.
     Defaults to 'technical' when no clear signal is found.
     """
     # Prefer the explicit structured label produced by the Planner prompt
@@ -602,10 +650,21 @@ def _decide_role(text: str) -> str:
         return "creative"
     if "ROLE TO CALL: Technical Expert" in text:
         return "technical"
-    # Fallback: word-boundary match so 'creative' in 'not creative enough' still works,
-    # but avoids false hits from unrelated use of the word.
+    if "ROLE TO CALL: Research Analyst" in text:
+        return "research"
+    if "ROLE TO CALL: Security Reviewer" in text:
+        return "security"
+    if "ROLE TO CALL: Data Analyst" in text:
+        return "data_analyst"
+    # Fallback: word-boundary match
     if re.search(r"\bcreative\b", text, re.IGNORECASE):
         return "creative"
+    if re.search(r"\bresearch\b", text, re.IGNORECASE):
+        return "research"
+    if re.search(r"\bsecurity\b", text, re.IGNORECASE):
+        return "security"
+    if re.search(r"\bdata\s+analyst\b", text, re.IGNORECASE):
+        return "data_analyst"
     return "technical"
 
 
@@ -735,6 +794,67 @@ def _step_planner_review(chat_model, state: WorkflowState, trace: List[str]) -> 
     return state
 
 
+def _step_research(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowState:
+    """Research Analyst: gather information and produce a comprehensive research summary."""
+    trace.append("\n╔══ [RESEARCH ANALYST] Gathering information... ══╗")
+    content = (
+        f"User request: {state['user_request']}\n\n"
+        f"Planner instructions:\n{state['plan']}"
+    )
+    if state["revision_count"] > 0:
+        content += f"\n\nQA feedback to address:\n{state['qa_report']}"
+    text = _llm_call(chat_model, _RESEARCH_SYSTEM, content)
+    state["research_output"] = text
+    state["draft_output"] = text
+    trace.append(text)
+    trace.append("╚══ [RESEARCH ANALYST] Done ══╝")
+    return state
+
+
+def _step_security(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowState:
+    """Security Reviewer: analyse output for vulnerabilities and produce a secure revision."""
+    trace.append("\n╔══ [SECURITY REVIEWER] Analysing for security issues... ══╗")
+    content = (
+        f"User request: {state['user_request']}\n\n"
+        f"Planner instructions:\n{state['plan']}"
+    )
+    if state["revision_count"] > 0:
+        content += f"\n\nQA feedback to address:\n{state['qa_report']}"
+    text = _llm_call(chat_model, _SECURITY_SYSTEM, content)
+    state["security_output"] = text
+    state["draft_output"] = text
+    trace.append(text)
+    trace.append("╚══ [SECURITY REVIEWER] Done ══╝")
+    return state
+
+
+def _step_data_analyst(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowState:
+    """Data Analyst: analyse data, identify patterns, and produce actionable insights."""
+    trace.append("\n╔══ [DATA ANALYST] Analysing data and patterns... ══╗")
+    content = (
+        f"User request: {state['user_request']}\n\n"
+        f"Planner instructions:\n{state['plan']}"
+    )
+    if state["revision_count"] > 0:
+        content += f"\n\nQA feedback to address:\n{state['qa_report']}"
+    text = _llm_call(chat_model, _DATA_ANALYST_SYSTEM, content)
+    state["data_analyst_output"] = text
+    state["draft_output"] = text
+    trace.append(text)
+    trace.append("╚══ [DATA ANALYST] Done ══╝")
+    return state
+
+
+# Mapping from role key → step function, used by the orchestration loop
+_SPECIALIST_STEPS = {
+    "creative": _step_creative,
+    "technical": _step_technical,
+    "research": _step_research,
+    "security": _step_security,
+    "data_analyst": _step_data_analyst,
+}
+
+
 # --- Specialist role tools ---
 # These wrap the step functions as @tool so the Planner (or any LangChain agent)
 # can invoke specialists in a standard tool-use pattern.
@@ -742,16 +862,20 @@ def _step_planner_review(chat_model, state: WorkflowState, trace: List[str]) -> 
 # Holds the active model ID for standalone specialist tool calls.
 _workflow_model_id: str = DEFAULT_MODEL_ID
 
+_EMPTY_STATE_BASE: WorkflowState = {
+    "user_request": "", "plan": "", "current_role": "",
+    "creative_output": "", "technical_output": "",
+    "research_output": "", "security_output": "", "data_analyst_output": "",
+    "draft_output": "", "qa_report": "", "qa_passed": False,
+    "revision_count": 0, "final_answer": "",
+}
+
 
 @tool
 def call_creative_expert(task: str) -> str:
     """Call the Creative Expert to brainstorm ideas, framing, and produce a draft for a given task."""
     chat = build_provider_chat(_workflow_model_id)
-    state: WorkflowState = {
-        "user_request": task, "plan": task, "current_role": "creative",
-        "creative_output": "", "technical_output": "", "draft_output": "",
-        "qa_report": "", "qa_passed": False, "revision_count": 0, "final_answer": "",
-    }
+    state: WorkflowState = {**_EMPTY_STATE_BASE, "user_request": task, "plan": task, "current_role": "creative"}
     state = _step_creative(chat, state, [])
     return state["creative_output"]
 
@@ -760,11 +884,7 @@ def call_creative_expert(task: str) -> str:
 def call_technical_expert(task: str) -> str:
     """Call the Technical Expert to produce implementation details and a solution for a given task."""
     chat = build_provider_chat(_workflow_model_id)
-    state: WorkflowState = {
-        "user_request": task, "plan": task, "current_role": "technical",
-        "creative_output": "", "technical_output": "", "draft_output": "",
-        "qa_report": "", "qa_passed": False, "revision_count": 0, "final_answer": "",
-    }
+    state: WorkflowState = {**_EMPTY_STATE_BASE, "user_request": task, "plan": task, "current_role": "technical"}
     state = _step_technical(chat, state, [])
     return state["technical_output"]
 
@@ -782,27 +902,60 @@ def call_qa_tester(task_and_output: str) -> str:
         task = task_and_output
         output = task_and_output
     # current_role is left empty — this is a standalone QA call outside the normal loop
-    state: WorkflowState = {
-        "user_request": task, "plan": task, "current_role": "",
-        "creative_output": "", "technical_output": "", "draft_output": output,
-        "qa_report": "", "qa_passed": False, "revision_count": 0, "final_answer": "",
-    }
+    state: WorkflowState = {**_EMPTY_STATE_BASE, "user_request": task, "plan": task, "draft_output": output}
     state = _step_qa(chat, state, [])
     return state["qa_report"]
 
 
+@tool
+def call_research_analyst(task: str) -> str:
+    """Call the Research Analyst to gather information and summarize findings for a given task."""
+    chat = build_provider_chat(_workflow_model_id)
+    state: WorkflowState = {**_EMPTY_STATE_BASE, "user_request": task, "plan": task, "current_role": "research"}
+    state = _step_research(chat, state, [])
+    return state["research_output"]
+
+
+@tool
+def call_security_reviewer(task: str) -> str:
+    """Call the Security Reviewer to analyse output for vulnerabilities and security best practices."""
+    chat = build_provider_chat(_workflow_model_id)
+    state: WorkflowState = {**_EMPTY_STATE_BASE, "user_request": task, "plan": task, "current_role": "security"}
+    state = _step_security(chat, state, [])
+    return state["security_output"]
+
+
+@tool
+def call_data_analyst(task: str) -> str:
+    """Call the Data Analyst to analyse data, identify patterns, and provide actionable insights."""
+    chat = build_provider_chat(_workflow_model_id)
+    state: WorkflowState = {**_EMPTY_STATE_BASE, "user_request": task, "plan": task, "current_role": "data_analyst"}
+    state = _step_data_analyst(chat, state, [])
+    return state["data_analyst_output"]
+
+
 # --- Orchestration loop ---
 
-def run_multi_role_workflow(message: str, model_id: str) -> Tuple[str, str]:
+def run_multi_role_workflow(
+    message: str,
+    model_id: str,
+    active_role_labels: Optional[List[str]] = None,
+) -> Tuple[str, str]:
     """Run the supervisor-style multi-role workflow.
 
     Flow:
-      1. Planner analyses the task and picks a specialist.
-      2. Specialist (Creative or Technical) generates output.
-      3. QA Tester reviews the output.
-      4. Planner reviews QA result and either approves or requests a revision.
+      1. Planner (if active) analyses the task and picks a specialist.
+      2. Specialist generates output; falls back to first active specialist if chosen one is disabled.
+      3. QA Tester (if active) reviews the output.
+      4. Planner (if active) reviews QA result and either approves or requests a revision.
       5. Repeat from step 2 if QA fails and retries remain.
       6. If max retries are reached, return best attempt with QA concerns.
+
+    Args:
+        message: The user's task or request.
+        model_id: HuggingFace model ID to use.
+        active_role_labels: Display names of active agent roles (e.g. ["Planner", "Technical Expert"]).
+                            Defaults to all roles when None.
 
     Returns:
         (final_answer, workflow_trace_text)
@@ -811,12 +964,30 @@ def run_multi_role_workflow(message: str, model_id: str) -> Tuple[str, str]:
     _workflow_model_id = model_id
     chat_model = build_provider_chat(model_id)
 
+    # Resolve active role keys from display labels
+    if active_role_labels is None:
+        active_role_labels = list(AGENT_ROLES.values())
+    active_keys = {_ROLE_LABEL_TO_KEY[lbl] for lbl in active_role_labels if lbl in _ROLE_LABEL_TO_KEY}
+
+    # Determine which specialist keys are active (ordered list for deterministic fallback)
+    all_specialist_keys = ["creative", "technical", "research", "security", "data_analyst"]
+    active_specialist_keys = [k for k in all_specialist_keys if k in active_keys]
+
+    planner_active = "planner" in active_keys
+    qa_active = "qa_tester" in active_keys
+
+    if not active_specialist_keys:
+        return "No specialist agents are active. Please enable at least one specialist role.", ""
+
     state: WorkflowState = {
         "user_request": message,
         "plan": "",
         "current_role": "",
         "creative_output": "",
         "technical_output": "",
+        "research_output": "",
+        "security_output": "",
+        "data_analyst_output": "",
         "draft_output": "",
         "qa_report": "",
         "qa_passed": False,
@@ -828,43 +999,67 @@ def run_multi_role_workflow(message: str, model_id: str) -> Tuple[str, str]:
         "═══ MULTI-ROLE WORKFLOW STARTED ═══",
         f"Model   : {model_id}",
         f"Request : {message}",
+        f"Active roles: {', '.join(active_role_labels)}",
         f"Max revisions: {MAX_REVISIONS}",
     ]
 
     try:
-        # Step 1: Planner creates the initial plan
-        state = _step_plan(chat_model, state, trace)
+        if planner_active:
+            # Step 1: Planner creates the initial plan
+            state = _step_plan(chat_model, state, trace)
+        else:
+            # No planner: auto-select first active specialist
+            state["current_role"] = active_specialist_keys[0]
+            state["plan"] = message
+            trace.append(
+                f"\n[Planner disabled] Auto-routing to: {state['current_role'].upper()}"
+            )
 
         # Orchestration loop: specialist → QA → Planner review → revise if needed
         while True:
-            # Step 2: invoke the chosen specialist
-            if state["current_role"] == "creative":
-                state = _step_creative(chat_model, state, trace)
+            # Step 2: invoke the chosen specialist, falling back if that role is disabled
+            role = state["current_role"]
+            if role not in active_specialist_keys:
+                role = active_specialist_keys[0]
+                state["current_role"] = role
+                trace.append(f"  ⚠ Requested role not active — routing to {role.upper()}")
+
+            step_fn = _SPECIALIST_STEPS.get(role, _step_technical)
+            state = step_fn(chat_model, state, trace)
+
+            # Step 3: QA reviews the specialist's draft (if enabled)
+            if qa_active:
+                state = _step_qa(chat_model, state, trace)
             else:
-                state = _step_technical(chat_model, state, trace)
+                state["qa_passed"] = True
+                state["qa_report"] = "QA Tester is disabled — skipping quality review."
+                trace.append("\n[QA Tester disabled] Skipping quality review — auto-pass.")
 
-            # Step 3: QA reviews the specialist's draft
-            state = _step_qa(chat_model, state, trace)
+            # Step 4: Planner reviews QA and either approves or schedules a revision
+            if planner_active and qa_active:
+                state = _step_planner_review(chat_model, state, trace)
 
-            # Step 4: Planner reviews the QA result
-            state = _step_planner_review(chat_model, state, trace)
+                # Exit if the Planner approved the result
+                if state["final_answer"]:
+                    trace.append("\n═══ WORKFLOW COMPLETE — APPROVED ═══")
+                    break
 
-            # Exit if the Planner approved the result
-            if state["final_answer"]:
-                trace.append("\n═══ WORKFLOW COMPLETE — APPROVED ═══")
-                break
+                # Increment revision counter and enforce the retry limit
+                state["revision_count"] += 1
+                if state["revision_count"] >= MAX_REVISIONS:
+                    state["final_answer"] = state["draft_output"]
+                    trace.append(
+                        f"\n═══ MAX REVISIONS REACHED ({MAX_REVISIONS}) ═══\n"
+                        f"Returning best attempt. Outstanding QA concerns:\n{state['qa_report']}"
+                    )
+                    break
 
-            # Increment revision counter and enforce the retry limit
-            state["revision_count"] += 1
-            if state["revision_count"] >= MAX_REVISIONS:
+                trace.append(f"\n═══ REVISION {state['revision_count']} / {MAX_REVISIONS} ═══")
+            else:
+                # No Planner review loop — accept the draft as the final answer
                 state["final_answer"] = state["draft_output"]
-                trace.append(
-                    f"\n═══ MAX REVISIONS REACHED ({MAX_REVISIONS}) ═══\n"
-                    f"Returning best attempt. Outstanding QA concerns:\n{state['qa_report']}"
-                )
+                trace.append("\n═══ WORKFLOW COMPLETE ═══")
                 break
-
-            trace.append(f"\n═══ REVISION {state['revision_count']} / {MAX_REVISIONS} ═══")
 
     except Exception as exc:
         trace.append(f"\n[ERROR] {exc}\n{traceback.format_exc()}")
@@ -1235,9 +1430,10 @@ with gr.Blocks(title="LLM + Agent tools demo", theme=gr.themes.Soft()) as demo:
         with gr.Tab("Multi-Role Workflow"):
             gr.Markdown(
                 "## Supervisor-style Multi-Role Workflow\n"
-                "**Planner** → **Specialist** (Creative or Technical) → **QA Tester** → **Planner review**\n\n"
+                "**Planner** → **Specialist** → **QA Tester** → **Planner review**\n\n"
                 "The Planner breaks the task, picks the right specialist, and reviews QA feedback. "
-                f"If QA fails, the loop repeats up to **{MAX_REVISIONS}** times before accepting the best attempt."
+                f"If QA fails, the loop repeats up to **{MAX_REVISIONS}** times before accepting the best attempt.\n\n"
+                "Use the checkboxes on the right to enable or disable individual agent roles."
             )
 
             with gr.Row():
@@ -1247,15 +1443,24 @@ with gr.Blocks(title="LLM + Agent tools demo", theme=gr.themes.Soft()) as demo:
                     label="Model",
                 )
 
-            wf_input = gr.Textbox(
-                label="Task / Request",
-                placeholder=(
-                    "Describe what you want the multi-role team to work on…\n"
-                    "e.g. 'Write a short blog post about the benefits of open-source AI'"
-                ),
-                lines=3,
-            )
-            wf_submit_btn = gr.Button("▶ Run Multi-Role Workflow", variant="primary")
+            with gr.Row():
+                with gr.Column(scale=3):
+                    wf_input = gr.Textbox(
+                        label="Task / Request",
+                        placeholder=(
+                            "Describe what you want the multi-role team to work on…\n"
+                            "e.g. 'Write a short blog post about the benefits of open-source AI'"
+                        ),
+                        lines=3,
+                    )
+                    wf_submit_btn = gr.Button("▶ Run Multi-Role Workflow", variant="primary")
+
+                with gr.Column(scale=1):
+                    active_agents = gr.CheckboxGroup(
+                        choices=list(AGENT_ROLES.values()),
+                        value=list(AGENT_ROLES.values()),
+                        label="Active agent roles",
+                    )
 
             with gr.Row():
                 with gr.Column(scale=2):
@@ -1271,26 +1476,30 @@ with gr.Blocks(title="LLM + Agent tools demo", theme=gr.themes.Soft()) as demo:
                         interactive=False,
                     )
 
-            def _run_workflow_ui(message: str, model_id: str) -> Tuple[str, str]:
+            def _run_workflow_ui(
+                message: str, model_id: str, role_labels: List[str]
+            ) -> Tuple[str, str]:
                 """Gradio handler: validate input, run the workflow, return outputs."""
                 if not message or not message.strip():
                     return "No input provided.", ""
                 try:
-                    final_answer, trace = run_multi_role_workflow(message.strip(), model_id)
+                    final_answer, trace = run_multi_role_workflow(
+                        message.strip(), model_id, role_labels
+                    )
                     return final_answer, trace
                 except Exception as exc:
                     return f"Workflow error: {exc}", traceback.format_exc()
 
             wf_submit_btn.click(
                 fn=_run_workflow_ui,
-                inputs=[wf_input, wf_model_dropdown],
+                inputs=[wf_input, wf_model_dropdown, active_agents],
                 outputs=[wf_answer, wf_trace],
                 show_api=False,
             )
 
             wf_input.submit(
                 fn=_run_workflow_ui,
-                inputs=[wf_input, wf_model_dropdown],
+                inputs=[wf_input, wf_model_dropdown, active_agents],
                 outputs=[wf_answer, wf_trace],
                 show_api=False,
             )
