@@ -1809,8 +1809,29 @@ def run_multi_role_workflow(
                     break
 
                 trace.append(f"\n═══ REVISION {state['revision_count']} / {MAX_REVISIONS} ═══")
+            elif qa_active and not state["qa_passed"] and state["qa_role_feedback"]:
+                # QA gave targeted role-specific feedback but there is no planner to
+                # arbitrate.  Drive revisions directly from QA feedback so each expert
+                # that received feedback can produce an updated response.
+                state["revision_count"] += 1
+                if state["revision_count"] >= MAX_REVISIONS:
+                    state["final_answer"] = state["draft_output"]
+                    trace.append(
+                        f"\n═══ MAX REVISIONS REACHED ({MAX_REVISIONS}) ═══\n"
+                        f"Returning best attempt. Outstanding QA concerns:\n{state['qa_report']}"
+                    )
+                    break
+                feedback_roles = ", ".join(
+                    AGENT_ROLES.get(k, k) for k in state["qa_role_feedback"]
+                )
+                trace.append(
+                    f"\n═══ QA-DRIVEN REVISION {state['revision_count']} / {MAX_REVISIONS} ═══\n"
+                    f"Experts with targeted feedback: {feedback_roles}"
+                )
+                # Loop continues — each specialist receives its targeted QA feedback on
+                # the next iteration and refines its response accordingly.
             else:
-                # No Planner review loop — accept the draft as the final answer
+                # No revision needed — accept the draft as the final answer
                 state["final_answer"] = state["draft_output"]
                 trace.append("\n═══ WORKFLOW COMPLETE ═══")
                 break
