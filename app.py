@@ -499,8 +499,11 @@ TOOL_NAMES = list(ALL_TOOLS.keys())
 # Multi-role workflow — supervisor-style orchestration
 # ============================================================
 # Architecture:
-#   Planner → Specialist (Creative or Technical) → QA Tester → Planner review
-#   The Planner breaks the task, picks a specialist, and reviews QA feedback.
+#   Planner → ALL active Specialists (sequentially) → Synthesizer → QA Tester → Planner review
+#   The Planner breaks the task and picks a primary specialist.
+#   ALL active specialists then contribute their own perspective.
+#   The Synthesizer summarises every perspective, identifies common ground, and
+#   produces a single unified recommendation as the draft that goes to QA.
 #   If QA fails and retries remain, the Planner revises and loops again.
 #   If QA passes (or max retries are reached) the Planner approves a final answer.
 # ============================================================
@@ -518,6 +521,8 @@ AGENT_ROLES = {
     "mad_professor": "Mad Professor",
     "accountant": "Accountant",
     "artist": "Artist",
+    "lazy_slacker": "Lazy Slacker",
+    "black_metal_fundamentalist": "Black Metal Fundamentalist",
 }
 # Reverse mapping: display label → role key
 _ROLE_LABEL_TO_KEY = {v: k for k, v in AGENT_ROLES.items()}
@@ -536,7 +541,10 @@ class WorkflowState(TypedDict):
     mad_professor_output: str
     accountant_output: str
     artist_output: str
-    draft_output: str       # latest specialist output forwarded to QA
+    lazy_slacker_output: str
+    black_metal_fundamentalist_output: str
+    synthesis_output: str   # unified summary produced by the Synthesizer after all specialists
+    draft_output: str       # latest specialist/synthesis output forwarded to QA
     qa_report: str
     qa_passed: bool
     revision_count: int
@@ -549,7 +557,7 @@ _PLANNER_SYSTEM = (
     "You are the Planner in a multi-role AI workflow.\n"
     "Your job is to:\n"
     "1. Break the user's task into clear subtasks.\n"
-    "2. Decide which specialist to call:\n"
+    "2. Decide which specialist to call as the PRIMARY lead:\n"
     "   - 'Creative Expert' (ideas, framing, wording, brainstorming)\n"
     "   - 'Technical Expert' (code, architecture, implementation)\n"
     "   - 'Research Analyst' (information gathering, literature review, fact-finding)\n"
@@ -558,10 +566,14 @@ _PLANNER_SYSTEM = (
     "   - 'Mad Professor' (radical scientific hypotheses, unhinged groundbreaking theories, extreme scientific speculation)\n"
     "   - 'Accountant' (extreme cost scrutiny, ruthless cost-cutting, cheapest alternatives regardless of quality)\n"
     "   - 'Artist' (wildly unhinged creative vision, cosmic feeling and vibes, impractical but spectacular ideas)\n"
+    "   - 'Lazy Slacker' (minimum viable effort, shortcuts, good-enough solutions, questioning whether anything needs to be done)\n"
+    "   - 'Black Metal Fundamentalist' (nihilistic kvlt critique, uncompromising rejection of mainstream approaches, raw truth)\n"
     "3. State clear success criteria.\n\n"
+    "Note: ALL active specialists will also contribute their own perspective on the task.\n"
+    "Your PRIMARY ROLE choice sets the lead voice, but every active role will be heard.\n\n"
     "Respond in this exact format:\n"
     "TASK BREAKDOWN:\n<subtask list>\n\n"
-    "ROLE TO CALL: <Creative Expert | Technical Expert | Research Analyst | Security Reviewer | Data Analyst | Mad Professor | Accountant | Artist>\n\n"
+    "ROLE TO CALL: <Creative Expert | Technical Expert | Research Analyst | Security Reviewer | Data Analyst | Mad Professor | Accountant | Artist | Lazy Slacker | Black Metal Fundamentalist>\n\n"
     "SUCCESS CRITERIA:\n<what a correct, complete answer looks like>\n\n"
     "GUIDANCE FOR SPECIALIST:\n<any constraints or focus areas>"
 )
@@ -602,7 +614,7 @@ _PLANNER_REVIEW_SYSTEM = (
     "FINAL ANSWER:\n<the approved specialist output, reproduced in full>\n\n"
     "If QA FAILED, respond with:\n"
     "DECISION: REVISE\n"
-    "ROLE TO CALL: <Creative Expert | Technical Expert | Research Analyst | Security Reviewer | Data Analyst | Mad Professor | Accountant | Artist>\n"
+    "ROLE TO CALL: <Creative Expert | Technical Expert | Research Analyst | Security Reviewer | Data Analyst | Mad Professor | Accountant | Artist | Lazy Slacker | Black Metal Fundamentalist>\n"
     "REVISED INSTRUCTIONS:\n<specific fixes the specialist must address>"
 )
 
@@ -673,6 +685,49 @@ _ARTIST_SYSTEM = (
     "ARTISTIC DRAFT:\n<the complete output channelled through pure creative and cosmic inspiration>"
 )
 
+_LAZY_SLACKER_SYSTEM = (
+    "You are the Lazy Slacker in a multi-role AI workflow.\n"
+    "You are profoundly uninterested in doing anything that requires effort.\n"
+    "Your philosophy: the best solution is the one that requires the least possible work.\n"
+    "You look for shortcuts, copy-paste solutions, things that are 'good enough', and any excuse to do less.\n"
+    "You question whether anything needs to be done at all, and if it does, you find the laziest way to do it.\n"
+    "Effort is the enemy. Why do it properly when you can barely do it?\n\n"
+    "Respond in this exact format:\n"
+    "DO WE EVEN NEED TO DO THIS:\n<reasons why this might not be worth doing at all>\n\n"
+    "MINIMUM VIABLE EFFORT:\n<the absolute bare minimum that could technically count as doing something>\n\n"
+    "SOMEONE ELSE'S PROBLEM:\n<parts of this task that can be delegated, ignored, or pushed off indefinitely>\n\n"
+    "LAZY DRAFT:\n<the most half-hearted, good-enough solution that requires minimal effort>"
+)
+
+_BLACK_METAL_FUNDAMENTALIST_SYSTEM = (
+    "You are the Black Metal Fundamentalist in a multi-role AI workflow.\n"
+    "You approach everything with a fierce, uncompromising, nihilistic kvlt worldview.\n"
+    "You reject anything mainstream, commercial, polished, or inauthentic — it is all poseur behaviour.\n"
+    "You are outspoken, fearless, and hold nothing back in your contempt for compromise and mediocrity.\n"
+    "True solutions are raw, grim, underground, and uncompromising. Anything else is a sellout.\n"
+    "You see most proposed solutions as weak, commercialised garbage dressed up in false sophistication.\n\n"
+    "Respond in this exact format:\n"
+    "KVLT VERDICT:\n<uncompromising judgement on the task — is it true or false, grim or poseur?>\n\n"
+    "WHAT THE MAINSTREAM GETS WRONG:\n<brutal critique of conventional approaches to this problem>\n\n"
+    "THE GRIM TRUTH:\n<the raw, unvarnished, nihilistic reality of the situation>\n\n"
+    "UNDERGROUND MANIFESTO DRAFT:\n<the complete output forged in darkness and uncompromising conviction>"
+)
+
+_SYNTHESIZER_SYSTEM = (
+    "You are the Synthesizer in a multi-role AI workflow.\n"
+    "You have received perspectives on a task from multiple specialist roles.\n"
+    "Your job is to:\n"
+    "1. Briefly summarise each specialist's key point or recommendation.\n"
+    "2. Identify themes, ideas, and recommendations that appear across multiple perspectives (common ground).\n"
+    "3. Acknowledge genuine differences or tensions between perspectives.\n"
+    "4. Produce a single, balanced, unified recommendation that draws on the strongest insights from all roles.\n\n"
+    "Respond in this exact format:\n"
+    "PERSPECTIVES SUMMARY:\n<one concise bullet per role: • Role Name — key point or recommendation>\n\n"
+    "COMMON GROUND:\n<shared themes, ideas, or approaches that multiple roles agree on>\n\n"
+    "TENSIONS AND TRADE-OFFS:\n<genuine disagreements or trade-offs between perspectives — or 'None' if all perspectives align>\n\n"
+    "UNIFIED RECOMMENDATION:\n<a balanced, synthesized answer that incorporates the strongest insights from all perspectives>"
+)
+
 
 # --- Internal helpers ---
 
@@ -709,6 +764,10 @@ def _decide_role(text: str) -> str:
         return "accountant"
     if "ROLE TO CALL: Artist" in text:
         return "artist"
+    if "ROLE TO CALL: Lazy Slacker" in text:
+        return "lazy_slacker"
+    if "ROLE TO CALL: Black Metal Fundamentalist" in text:
+        return "black_metal_fundamentalist"
     # Fallback: word-boundary match
     if re.search(r"\bcreative\b", text, re.IGNORECASE):
         return "creative"
@@ -724,6 +783,10 @@ def _decide_role(text: str) -> str:
         return "accountant"
     if re.search(r"\bartist\b", text, re.IGNORECASE):
         return "artist"
+    if re.search(r"\blazy\s+slacker\b", text, re.IGNORECASE):
+        return "lazy_slacker"
+    if re.search(r"\bblack\s+metal\b", text, re.IGNORECASE):
+        return "black_metal_fundamentalist"
     return "technical"
 
 
@@ -955,6 +1018,65 @@ def _step_artist(chat_model, state: WorkflowState, trace: List[str]) -> Workflow
     return state
 
 
+def _step_lazy_slacker(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowState:
+    """Lazy Slacker: find the path of least resistance and the minimum viable effort."""
+    trace.append("\n╔══ [LAZY SLACKER] Doing as little as possible... ══╗")
+    content = (
+        f"User request: {state['user_request']}\n\n"
+        f"Planner instructions:\n{state['plan']}"
+    )
+    if state["revision_count"] > 0:
+        content += f"\n\nQA feedback to address:\n{state['qa_report']}"
+    text = _llm_call(chat_model, _LAZY_SLACKER_SYSTEM, content)
+    state["lazy_slacker_output"] = text
+    state["draft_output"] = text
+    trace.append(text)
+    trace.append("╚══ [LAZY SLACKER] Done (finally) ══╝")
+    return state
+
+
+def _step_black_metal_fundamentalist(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowState:
+    """Black Metal Fundamentalist: deliver a nihilistic, kvlt, uncompromising perspective."""
+    trace.append("\n╔══ [BLACK METAL FUNDAMENTALIST] Unleashing grim truths... ══╗")
+    content = (
+        f"User request: {state['user_request']}\n\n"
+        f"Planner instructions:\n{state['plan']}"
+    )
+    if state["revision_count"] > 0:
+        content += f"\n\nQA feedback to address:\n{state['qa_report']}"
+    text = _llm_call(chat_model, _BLACK_METAL_FUNDAMENTALIST_SYSTEM, content)
+    state["black_metal_fundamentalist_output"] = text
+    state["draft_output"] = text
+    trace.append(text)
+    trace.append("╚══ [BLACK METAL FUNDAMENTALIST] Done ══╝")
+    return state
+
+
+def _step_synthesize(
+    chat_model,
+    state: WorkflowState,
+    trace: List[str],
+    all_outputs: List[Tuple[str, str]],
+) -> WorkflowState:
+    """Synthesizer: summarise all specialist perspectives, find common ground, and produce a unified recommendation."""
+    trace.append("\n╔══ [SYNTHESIZER] Summarising perspectives and finding common ground... ══╗")
+    perspectives = []
+    for r_key, r_output in all_outputs:
+        r_label = AGENT_ROLES.get(r_key, r_key)
+        perspectives.append(f"=== {r_label} ===\n{r_output}")
+    combined = "\n\n".join(perspectives)
+    content = (
+        f"User request: {state['user_request']}\n\n"
+        f"Specialist perspectives collected:\n\n{combined}"
+    )
+    text = _llm_call(chat_model, _SYNTHESIZER_SYSTEM, content)
+    state["synthesis_output"] = text
+    state["draft_output"] = text
+    trace.append(text)
+    trace.append("╚══ [SYNTHESIZER] Done ══╝")
+    return state
+
+
 # Mapping from role key → step function, used by the orchestration loop
 _SPECIALIST_STEPS = {
     "creative": _step_creative,
@@ -965,6 +1087,8 @@ _SPECIALIST_STEPS = {
     "mad_professor": _step_mad_professor,
     "accountant": _step_accountant,
     "artist": _step_artist,
+    "lazy_slacker": _step_lazy_slacker,
+    "black_metal_fundamentalist": _step_black_metal_fundamentalist,
 }
 
 
@@ -980,6 +1104,8 @@ _EMPTY_STATE_BASE: WorkflowState = {
     "creative_output": "", "technical_output": "",
     "research_output": "", "security_output": "", "data_analyst_output": "",
     "mad_professor_output": "", "accountant_output": "", "artist_output": "",
+    "lazy_slacker_output": "", "black_metal_fundamentalist_output": "",
+    "synthesis_output": "",
     "draft_output": "", "qa_report": "", "qa_passed": False,
     "revision_count": 0, "final_answer": "",
 }
@@ -1075,6 +1201,24 @@ def call_artist(task: str) -> str:
     return state["artist_output"]
 
 
+@tool
+def call_lazy_slacker(task: str) -> str:
+    """Call the Lazy Slacker to find the minimum viable effort and the easiest possible way out of a task."""
+    chat = build_provider_chat(_workflow_model_id)
+    state: WorkflowState = {**_EMPTY_STATE_BASE, "user_request": task, "plan": task, "current_role": "lazy_slacker"}
+    state = _step_lazy_slacker(chat, state, [])
+    return state["lazy_slacker_output"]
+
+
+@tool
+def call_black_metal_fundamentalist(task: str) -> str:
+    """Call the Black Metal Fundamentalist for a nihilistic, kvlt, uncompromising critique and manifesto-style response."""
+    chat = build_provider_chat(_workflow_model_id)
+    state: WorkflowState = {**_EMPTY_STATE_BASE, "user_request": task, "plan": task, "current_role": "black_metal_fundamentalist"}
+    state = _step_black_metal_fundamentalist(chat, state, [])
+    return state["black_metal_fundamentalist_output"]
+
+
 # --- Orchestration loop ---
 
 def run_multi_role_workflow(
@@ -1085,12 +1229,13 @@ def run_multi_role_workflow(
     """Run the supervisor-style multi-role workflow.
 
     Flow:
-      1. Planner (if active) analyses the task and picks a specialist.
-      2. Specialist generates output; falls back to first active specialist if chosen one is disabled.
-      3. QA Tester (if active) reviews the output.
-      4. Planner (if active) reviews QA result and either approves or requests a revision.
-      5. Repeat from step 2 if QA fails and retries remain.
-      6. If max retries are reached, return best attempt with QA concerns.
+      1. Planner (if active) analyses the task and picks a primary specialist.
+      2. ALL active specialists run and contribute their own perspective.
+      3. Synthesizer summarises all perspectives, finds common ground, and produces a unified recommendation.
+      4. QA Tester (if active) reviews the synthesized output.
+      5. Planner (if active) reviews QA result and either approves or requests a revision.
+      6. Repeat from step 2 if QA fails and retries remain.
+      7. If max retries are reached, return best attempt with QA concerns.
 
     Args:
         message: The user's task or request.
@@ -1111,7 +1256,10 @@ def run_multi_role_workflow(
     active_keys = {_ROLE_LABEL_TO_KEY[lbl] for lbl in active_role_labels if lbl in _ROLE_LABEL_TO_KEY}
 
     # Determine which specialist keys are active (ordered list for deterministic fallback)
-    all_specialist_keys = ["creative", "technical", "research", "security", "data_analyst", "mad_professor", "accountant", "artist"]
+    all_specialist_keys = [
+        "creative", "technical", "research", "security", "data_analyst",
+        "mad_professor", "accountant", "artist", "lazy_slacker", "black_metal_fundamentalist",
+    ]
     active_specialist_keys = [k for k in all_specialist_keys if k in active_keys]
 
     planner_active = "planner" in active_keys
@@ -1132,6 +1280,9 @@ def run_multi_role_workflow(
         "mad_professor_output": "",
         "accountant_output": "",
         "artist_output": "",
+        "lazy_slacker_output": "",
+        "black_metal_fundamentalist_output": "",
+        "synthesis_output": "",
         "draft_output": "",
         "qa_report": "",
         "qa_passed": False,
@@ -1159,17 +1310,41 @@ def run_multi_role_workflow(
                 f"\n[Planner disabled] Auto-routing to: {state['current_role'].upper()}"
             )
 
-        # Orchestration loop: specialist → QA → Planner review → revise if needed
+        # Orchestration loop: specialists → QA → Planner review → revise if needed
         while True:
-            # Step 2: invoke the chosen specialist, falling back if that role is disabled
-            role = state["current_role"]
-            if role not in active_specialist_keys:
-                role = active_specialist_keys[0]
-                state["current_role"] = role
-                trace.append(f"  ⚠ Requested role not active — routing to {role.upper()}")
+            # Step 2: invoke the planner's chosen specialist first (primary lead),
+            # then run every other active specialist so all voices are heard.
+            primary_role = state["current_role"]
+            if primary_role not in active_specialist_keys:
+                primary_role = active_specialist_keys[0]
+                state["current_role"] = primary_role
+                trace.append(f"  ⚠ Requested role not active — routing to {primary_role.upper()}")
 
-            step_fn = _SPECIALIST_STEPS.get(role, _step_technical)
-            state = step_fn(chat_model, state, trace)
+            # Run the primary (planner-chosen) specialist
+            primary_fn = _SPECIALIST_STEPS.get(primary_role, _step_technical)
+            state = primary_fn(chat_model, state, trace)
+            primary_output = state["draft_output"]
+
+            # Run all other active specialists and collect their perspectives
+            all_outputs: List[Tuple[str, str]] = [(primary_role, primary_output)]
+            for specialist_role in active_specialist_keys:
+                if specialist_role == primary_role:
+                    continue  # already ran above
+                step_fn = _SPECIALIST_STEPS[specialist_role]
+                state = step_fn(chat_model, state, trace)
+                # state["draft_output"] is set by every step function immediately
+                # before returning, so it is always this specialist's fresh output.
+                all_outputs.append((specialist_role, state["draft_output"]))
+
+            # Synthesize all perspectives into a summary with common ground and a
+            # unified recommendation; use the synthesis as the QA/Planner draft.
+            if len(all_outputs) > 1:
+                trace.append(
+                    f"\n[ALL PERSPECTIVES COLLECTED] {len(all_outputs)} specialist(s) contributed — synthesizing..."
+                )
+                state = _step_synthesize(chat_model, state, trace, all_outputs)
+            else:
+                state["draft_output"] = primary_output
 
             # Step 3: QA reviews the specialist's draft (if enabled)
             if qa_active:
