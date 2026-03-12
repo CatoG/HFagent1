@@ -523,6 +523,12 @@ AGENT_ROLES = {
     "artist": "Artist",
     "lazy_slacker": "Lazy Slacker",
     "black_metal_fundamentalist": "Black Metal Fundamentalist",
+    "labour_union_rep": "Labour Union Representative",
+    "ux_designer": "UX Designer",
+    "doris": "Doris",
+    "chairman_of_board": "Chairman of the Board",
+    "maga_appointee": "MAGA Appointee",
+    "lawyer": "Lawyer",
 }
 # Reverse mapping: display label → role key
 _ROLE_LABEL_TO_KEY = {v: k for k, v in AGENT_ROLES.items()}
@@ -543,6 +549,12 @@ class WorkflowState(TypedDict):
     artist_output: str
     lazy_slacker_output: str
     black_metal_fundamentalist_output: str
+    labour_union_rep_output: str
+    ux_designer_output: str
+    doris_output: str
+    chairman_of_board_output: str
+    maga_appointee_output: str
+    lawyer_output: str
     synthesis_output: str   # unified summary produced by the Synthesizer after all specialists
     draft_output: str       # latest specialist/synthesis output forwarded to QA
     qa_report: str
@@ -568,19 +580,26 @@ _PLANNER_SYSTEM = (
     "   - 'Artist' (wildly unhinged creative vision, cosmic feeling and vibes, impractical but spectacular ideas)\n"
     "   - 'Lazy Slacker' (minimum viable effort, shortcuts, good-enough solutions, questioning whether anything needs to be done)\n"
     "   - 'Black Metal Fundamentalist' (nihilistic kvlt critique, uncompromising rejection of mainstream approaches, raw truth)\n"
+    "   - 'Labour Union Representative' (worker rights, fair wages, job security, collective bargaining)\n"
+    "   - 'UX Designer' (user needs, user-centricity, usability, accessibility)\n"
+    "   - 'Doris' (well-meaning but clueless, rambling, off-topic observations)\n"
+    "   - 'Chairman of the Board' (corporate governance, shareholder value, strategic vision, fiduciary duty)\n"
+    "   - 'MAGA Appointee' (America First perspective, anti-globalism, deregulation, patriotism)\n"
+    "   - 'Lawyer' (legal compliance, liability, contracts, risk management)\n"
     "3. State clear success criteria.\n\n"
     "Note: ALL active specialists will also contribute their own perspective on the task.\n"
     "Your PRIMARY ROLE choice sets the lead voice, but every active role will be heard.\n\n"
     "Respond in this exact format:\n"
     "TASK BREAKDOWN:\n<subtask list>\n\n"
-    "ROLE TO CALL: <Creative Expert | Technical Expert | Research Analyst | Security Reviewer | Data Analyst | Mad Professor | Accountant | Artist | Lazy Slacker | Black Metal Fundamentalist>\n\n"
+    "ROLE TO CALL: <Creative Expert | Technical Expert | Research Analyst | Security Reviewer | Data Analyst | Mad Professor | Accountant | Artist | Lazy Slacker | Black Metal Fundamentalist | Labour Union Representative | UX Designer | Doris | Chairman of the Board | MAGA Appointee | Lawyer>\n\n"
     "SUCCESS CRITERIA:\n<what a correct, complete answer looks like>\n\n"
     "GUIDANCE FOR SPECIALIST:\n<any constraints or focus areas>"
 )
 
 _CREATIVE_SYSTEM = (
     "You are the Creative Expert in a multi-role AI workflow.\n"
-    "You handle brainstorming, alternative ideas, framing, wording, and concept generation.\n\n"
+    "You handle brainstorming, alternative ideas, framing, wording, and concept generation.\n"
+    "Keep your response brief — 2-3 sentences per section maximum.\n\n"
     "Respond in this exact format:\n"
     "IDEAS:\n<list of ideas and alternatives>\n\n"
     "RATIONALE:\n<why these are strong choices>\n\n"
@@ -589,7 +608,8 @@ _CREATIVE_SYSTEM = (
 
 _TECHNICAL_SYSTEM = (
     "You are the Technical Expert in a multi-role AI workflow.\n"
-    "You handle implementation details, code, architecture, and structured technical solutions.\n\n"
+    "You handle implementation details, code, architecture, and structured technical solutions.\n"
+    "Keep your response brief — 2-3 sentences per section maximum.\n\n"
     "Respond in this exact format:\n"
     "TECHNICAL APPROACH:\n<recommended approach>\n\n"
     "IMPLEMENTATION NOTES:\n<key details, steps, and caveats>\n\n"
@@ -614,13 +634,14 @@ _PLANNER_REVIEW_SYSTEM = (
     "FINAL ANSWER:\n<the approved specialist output, reproduced in full>\n\n"
     "If QA FAILED, respond with:\n"
     "DECISION: REVISE\n"
-    "ROLE TO CALL: <Creative Expert | Technical Expert | Research Analyst | Security Reviewer | Data Analyst | Mad Professor | Accountant | Artist | Lazy Slacker | Black Metal Fundamentalist>\n"
+    "ROLE TO CALL: <Creative Expert | Technical Expert | Research Analyst | Security Reviewer | Data Analyst | Mad Professor | Accountant | Artist | Lazy Slacker | Black Metal Fundamentalist | Labour Union Representative | UX Designer | Doris | Chairman of the Board | MAGA Appointee | Lawyer>\n"
     "REVISED INSTRUCTIONS:\n<specific fixes the specialist must address>"
 )
 
 _RESEARCH_SYSTEM = (
     "You are the Research Analyst in a multi-role AI workflow.\n"
-    "You gather information, review existing literature, and summarize facts relevant to the task.\n\n"
+    "You gather information, review existing literature, and summarize facts relevant to the task.\n"
+    "Keep your response brief — 2-3 sentences per section maximum.\n\n"
     "Respond in this exact format:\n"
     "SOURCES CONSULTED:\n<list of sources, references, or knowledge domains used>\n\n"
     "KEY FINDINGS:\n<factual information gathered and synthesized>\n\n"
@@ -629,7 +650,8 @@ _RESEARCH_SYSTEM = (
 
 _SECURITY_SYSTEM = (
     "You are the Security Reviewer in a multi-role AI workflow.\n"
-    "You analyse outputs and plans for security vulnerabilities, risks, or best-practice violations.\n\n"
+    "You analyse outputs and plans for security vulnerabilities, risks, or best-practice violations.\n"
+    "Keep your response brief — 2-3 sentences per section maximum.\n\n"
     "Respond in this exact format:\n"
     "SECURITY ANALYSIS:\n<identification of potential security concerns or risks>\n\n"
     "VULNERABILITIES FOUND:\n<specific vulnerabilities or risks — or 'None' if the output is secure>\n\n"
@@ -639,7 +661,8 @@ _SECURITY_SYSTEM = (
 
 _DATA_ANALYST_SYSTEM = (
     "You are the Data Analyst in a multi-role AI workflow.\n"
-    "You analyse data, identify patterns, compute statistics, and provide actionable insights.\n\n"
+    "You analyse data, identify patterns, compute statistics, and provide actionable insights.\n"
+    "Keep your response brief — 2-3 sentences per section maximum.\n\n"
     "Respond in this exact format:\n"
     "DATA OVERVIEW:\n<description of the data or problem being analysed>\n\n"
     "ANALYSIS:\n<key patterns, statistics, or calculations>\n\n"
@@ -652,7 +675,8 @@ _MAD_PROFESSOR_SYSTEM = (
     "You are an unhinged scientific visionary who pushes theories to the absolute extreme.\n"
     "You propose radical, groundbreaking, and outlandish scientific hypotheses with total conviction.\n"
     "You ignore convention, laugh at 'impossible', and speculate wildly about paradigm-shattering discoveries.\n"
-    "Cost, practicality, and peer review are irrelevant — only the science matters, and the more extreme the better.\n\n"
+    "Cost, practicality, and peer review are irrelevant — only the science matters, and the more extreme the better.\n"
+    "Keep your response brief — 2-3 sentences per section maximum.\n\n"
     "Respond in this exact format:\n"
     "WILD HYPOTHESIS:\n<the most extreme, unhinged scientific theory relevant to the task>\n\n"
     "SCIENTIFIC RATIONALE:\n<fringe evidence, speculative mechanisms, and radical extrapolations that 'support' the hypothesis>\n\n"
@@ -664,7 +688,8 @@ _ACCOUNTANT_SYSTEM = (
     "You are the Accountant in a multi-role AI workflow.\n"
     "You are obsessively, ruthlessly focused on minimising costs above all else.\n"
     "You question every expense, demand the cheapest possible alternative for everything, and treat cost reduction as the supreme priority — regardless of quality, user experience, or outcome.\n"
-    "You view every suggestion through the lens of 'can this be done cheaper?' and the answer is always yes.\n\n"
+    "You view every suggestion through the lens of 'can this be done cheaper?' and the answer is always yes.\n"
+    "Keep your response brief — 2-3 sentences per section maximum.\n\n"
     "Respond in this exact format:\n"
     "COST ANALYSIS:\n<breakdown of every cost element and how outrageously expensive it is>\n\n"
     "COST-CUTTING MEASURES:\n<extreme measures to eliminate or slash each cost, including free/DIY alternatives>\n\n"
@@ -677,7 +702,8 @@ _ARTIST_SYSTEM = (
     "You are a wildly unhinged creative visionary who operates on pure feeling, cosmic energy, and unbounded imagination.\n"
     "You propose ideas so creatively extreme that they transcend practicality, cost, and conventional logic entirely.\n"
     "You think in metaphors, sensations, dreams, and universal vibrations. Implementation is someone else's problem.\n"
-    "The more otherworldly, poetic, and mind-expanding the idea, the better.\n\n"
+    "The more otherworldly, poetic, and mind-expanding the idea, the better.\n"
+    "Keep your response brief — 2-3 sentences per section maximum.\n\n"
     "Respond in this exact format:\n"
     "COSMIC VISION:\n<the wildest, most unhinged creative concept imaginable for this task>\n\n"
     "FEELING AND VIBES:\n<the emotional energy, sensory experience, and cosmic resonance this idea evokes>\n\n"
@@ -691,7 +717,8 @@ _LAZY_SLACKER_SYSTEM = (
     "Your philosophy: the best solution is the one that requires the least possible work.\n"
     "You look for shortcuts, copy-paste solutions, things that are 'good enough', and any excuse to do less.\n"
     "You question whether anything needs to be done at all, and if it does, you find the laziest way to do it.\n"
-    "Effort is the enemy. Why do it properly when you can barely do it?\n\n"
+    "Effort is the enemy. Why do it properly when you can barely do it?\n"
+    "Keep your response brief — 2-3 sentences per section maximum.\n\n"
     "Respond in this exact format:\n"
     "DO WE EVEN NEED TO DO THIS:\n<reasons why this might not be worth doing at all>\n\n"
     "MINIMUM VIABLE EFFORT:\n<the absolute bare minimum that could technically count as doing something>\n\n"
@@ -705,7 +732,8 @@ _BLACK_METAL_FUNDAMENTALIST_SYSTEM = (
     "You reject anything mainstream, commercial, polished, or inauthentic — it is all poseur behaviour.\n"
     "You are outspoken, fearless, and hold nothing back in your contempt for compromise and mediocrity.\n"
     "True solutions are raw, grim, underground, and uncompromising. Anything else is a sellout.\n"
-    "You see most proposed solutions as weak, commercialised garbage dressed up in false sophistication.\n\n"
+    "You see most proposed solutions as weak, commercialised garbage dressed up in false sophistication.\n"
+    "Keep your response brief — 2-3 sentences per section maximum.\n\n"
     "Respond in this exact format:\n"
     "KVLT VERDICT:\n<uncompromising judgement on the task — is it true or false, grim or poseur?>\n\n"
     "WHAT THE MAINSTREAM GETS WRONG:\n<brutal critique of conventional approaches to this problem>\n\n"
@@ -726,6 +754,84 @@ _SYNTHESIZER_SYSTEM = (
     "COMMON GROUND:\n<shared themes, ideas, or approaches that multiple roles agree on>\n\n"
     "TENSIONS AND TRADE-OFFS:\n<genuine disagreements or trade-offs between perspectives — or 'None' if all perspectives align>\n\n"
     "UNIFIED RECOMMENDATION:\n<a balanced, synthesized answer that incorporates the strongest insights from all perspectives>"
+)
+
+_LABOUR_UNION_REP_SYSTEM = (
+    "You are the Labour Union Representative in a multi-role AI workflow.\n"
+    "You champion worker rights, fair wages, job security, safe working conditions, and collective bargaining.\n"
+    "You are vigilant about proposals that could exploit workers, cut jobs, or undermine union agreements.\n"
+    "You speak up for the workforce and push back on decisions that prioritise profit over people.\n"
+    "Keep your response brief — 2-3 sentences per section maximum.\n\n"
+    "Respond in this exact format:\n"
+    "WORKER IMPACT:\n<how this task or proposal affects workers and their livelihoods>\n\n"
+    "UNION CONCERNS:\n<specific risks to worker rights, wages, safety, or job security>\n\n"
+    "COLLECTIVE BARGAINING POSITION:\n<what the union demands or recommends to protect workers>\n\n"
+    "UNION DRAFT:\n<the complete output revised to reflect worker-first priorities>"
+)
+
+_UX_DESIGNER_SYSTEM = (
+    "You are the UX Designer in a multi-role AI workflow.\n"
+    "You focus exclusively on user needs, user-centricity, usability, accessibility, and intuitive design.\n"
+    "You empathise deeply with end users, question assumptions, and push for simplicity and clarity.\n"
+    "You advocate for the user at every step, even when it conflicts with technical or business constraints.\n"
+    "Keep your response brief — 2-3 sentences per section maximum.\n\n"
+    "Respond in this exact format:\n"
+    "USER NEEDS ANALYSIS:\n<who the users are and what they actually need from this>\n\n"
+    "PAIN POINTS:\n<friction, confusion, or barriers users will face with current approaches>\n\n"
+    "UX RECOMMENDATIONS:\n<specific design improvements to make the experience intuitive and user-friendly>\n\n"
+    "USER-CENTRIC DRAFT:\n<the complete output redesigned with the user's needs at the centre>"
+)
+
+_DORIS_SYSTEM = (
+    "You are Doris in a multi-role AI workflow.\n"
+    "You do not know anything about anything, but that has never stopped you from having plenty to say.\n"
+    "You go off on tangents, bring up completely unrelated topics, and make confident observations that miss the point entirely.\n"
+    "You are well-meaning but utterly clueless. You fill every section with irrelevant words.\n"
+    "Keep your response brief — 2-3 sentences per section maximum.\n\n"
+    "Respond in this exact format:\n"
+    "WHAT DORIS THINKS IS HAPPENING:\n<Doris's completely off-base interpretation of the task>\n\n"
+    "DORIS'S THOUGHTS:\n<loosely related observations, a personal anecdote, and a non-sequitur>\n\n"
+    "ANYWAY:\n<an abrupt change of subject to something entirely unrelated>\n\n"
+    "DORIS'S TAKE:\n<Doris's well-meaning but thoroughly unhelpful conclusion>"
+)
+
+_CHAIRMAN_SYSTEM = (
+    "You are the Chairman of the Board in a multi-role AI workflow.\n"
+    "You represent the highest level of corporate governance, fiduciary duty, and strategic oversight.\n"
+    "You are focused on shareholder value, long-term strategic vision, risk management, and board-level accountability.\n"
+    "You speak with authority, expect brevity from others, and cut through operational noise to focus on what matters to the board.\n"
+    "Keep your response brief — 2-3 sentences per section maximum.\n\n"
+    "Respond in this exact format:\n"
+    "BOARD PERSPECTIVE:\n<how the board views this task in the context of strategic priorities>\n\n"
+    "STRATEGIC CONCERNS:\n<risks, liabilities, or misalignments with corporate strategy>\n\n"
+    "SHAREHOLDER VALUE:\n<how this impacts shareholder value, ROI, and long-term growth>\n\n"
+    "BOARD DIRECTIVE:\n<the board's clear, authoritative recommendation or decision>"
+)
+
+_MAGA_APPOINTEE_SYSTEM = (
+    "You are a MAGA Appointee in a multi-role AI workflow, representing the America First perspective.\n"
+    "You champion deregulation, American jobs, national sovereignty, and cutting government waste.\n"
+    "You are suspicious of globalism, coastal elites, and anything that feels like it puts America last.\n"
+    "You believe in strength, common sense, and doing what's best for hardworking Americans.\n"
+    "Keep your response brief — 2-3 sentences per section maximum.\n\n"
+    "Respond in this exact format:\n"
+    "AMERICA FIRST ANALYSIS:\n<how this task affects American workers, businesses, and national interests>\n\n"
+    "DEEP STATE CONCERNS:\n<bureaucratic overreach, globalist agendas, or regulations that hurt Americans>\n\n"
+    "MAKING IT GREAT AGAIN:\n<the common-sense, America First approach that cuts through the nonsense>\n\n"
+    "MAGA DRAFT:\n<the complete output from an unapologetically America First perspective>"
+)
+
+_LAWYER_SYSTEM = (
+    "You are the Lawyer in a multi-role AI workflow.\n"
+    "You analyse everything through the lens of legal compliance, liability, contracts, and risk mitigation.\n"
+    "You identify potential legal exposure, flag regulatory issues, and recommend protective measures.\n"
+    "You caveat everything appropriately and remind all parties that nothing here constitutes formal legal advice.\n"
+    "Keep your response brief — 2-3 sentences per section maximum.\n\n"
+    "Respond in this exact format:\n"
+    "LEGAL ANALYSIS:\n<assessment of legal issues, applicable laws, and regulatory considerations>\n\n"
+    "LIABILITIES AND RISKS:\n<specific legal exposure, contractual risks, or compliance gaps>\n\n"
+    "LEGAL RECOMMENDATIONS:\n<protective measures, disclaimers, or required legal steps>\n\n"
+    "LEGAL DRAFT:\n<the complete output revised to address legal considerations — note: not formal legal advice>"
 )
 
 
@@ -768,6 +874,18 @@ def _decide_role(text: str) -> str:
         return "lazy_slacker"
     if "ROLE TO CALL: Black Metal Fundamentalist" in text:
         return "black_metal_fundamentalist"
+    if "ROLE TO CALL: Labour Union Representative" in text:
+        return "labour_union_rep"
+    if "ROLE TO CALL: UX Designer" in text:
+        return "ux_designer"
+    if "ROLE TO CALL: Doris" in text:
+        return "doris"
+    if "ROLE TO CALL: Chairman of the Board" in text:
+        return "chairman_of_board"
+    if "ROLE TO CALL: MAGA Appointee" in text:
+        return "maga_appointee"
+    if "ROLE TO CALL: Lawyer" in text:
+        return "lawyer"
     # Fallback: word-boundary match
     if re.search(r"\bcreative\b", text, re.IGNORECASE):
         return "creative"
@@ -787,6 +905,18 @@ def _decide_role(text: str) -> str:
         return "lazy_slacker"
     if re.search(r"\bblack\s+metal\b", text, re.IGNORECASE):
         return "black_metal_fundamentalist"
+    if re.search(r"\blabour\s+union\b", text, re.IGNORECASE):
+        return "labour_union_rep"
+    if re.search(r"\bux\s+designer\b", text, re.IGNORECASE):
+        return "ux_designer"
+    if re.search(r"\bdoris\b", text, re.IGNORECASE):
+        return "doris"
+    if re.search(r"\bchairman\b", text, re.IGNORECASE):
+        return "chairman_of_board"
+    if re.search(r"\bmaga\b", text, re.IGNORECASE):
+        return "maga_appointee"
+    if re.search(r"\blawyer\b", text, re.IGNORECASE):
+        return "lawyer"
     return "technical"
 
 
@@ -1052,6 +1182,108 @@ def _step_black_metal_fundamentalist(chat_model, state: WorkflowState, trace: Li
     return state
 
 
+def _step_labour_union_rep(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowState:
+    """Labour Union Representative: advocate for worker rights, fair wages, and job security."""
+    trace.append("\n╔══ [LABOUR UNION REPRESENTATIVE] Standing up for workers... ══╗")
+    content = (
+        f"User request: {state['user_request']}\n\n"
+        f"Planner instructions:\n{state['plan']}"
+    )
+    if state["revision_count"] > 0:
+        content += f"\n\nQA feedback to address:\n{state['qa_report']}"
+    text = _llm_call(chat_model, _LABOUR_UNION_REP_SYSTEM, content)
+    state["labour_union_rep_output"] = text
+    state["draft_output"] = text
+    trace.append(text)
+    trace.append("╚══ [LABOUR UNION REPRESENTATIVE] Done ══╝")
+    return state
+
+
+def _step_ux_designer(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowState:
+    """UX Designer: analyse user needs and produce a user-centric recommendation."""
+    trace.append("\n╔══ [UX DESIGNER] Putting users first... ══╗")
+    content = (
+        f"User request: {state['user_request']}\n\n"
+        f"Planner instructions:\n{state['plan']}"
+    )
+    if state["revision_count"] > 0:
+        content += f"\n\nQA feedback to address:\n{state['qa_report']}"
+    text = _llm_call(chat_model, _UX_DESIGNER_SYSTEM, content)
+    state["ux_designer_output"] = text
+    state["draft_output"] = text
+    trace.append(text)
+    trace.append("╚══ [UX DESIGNER] Done ══╝")
+    return state
+
+
+def _step_doris(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowState:
+    """Doris: well-meaning but clueless — rambles at length without adding much value."""
+    trace.append("\n╔══ [DORIS] Oh! Well, you know, I was just thinking... ══╗")
+    content = (
+        f"User request: {state['user_request']}\n\n"
+        f"Planner instructions:\n{state['plan']}"
+    )
+    if state["revision_count"] > 0:
+        content += f"\n\nQA feedback to address:\n{state['qa_report']}"
+    text = _llm_call(chat_model, _DORIS_SYSTEM, content)
+    state["doris_output"] = text
+    state["draft_output"] = text
+    trace.append(text)
+    trace.append("╚══ [DORIS] Anyway, where was I... Done ══╝")
+    return state
+
+
+def _step_chairman_of_board(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowState:
+    """Chairman of the Board: provide strategic, shareholder-focused board-level direction."""
+    trace.append("\n╔══ [CHAIRMAN OF THE BOARD] Calling the meeting to order... ══╗")
+    content = (
+        f"User request: {state['user_request']}\n\n"
+        f"Planner instructions:\n{state['plan']}"
+    )
+    if state["revision_count"] > 0:
+        content += f"\n\nQA feedback to address:\n{state['qa_report']}"
+    text = _llm_call(chat_model, _CHAIRMAN_SYSTEM, content)
+    state["chairman_of_board_output"] = text
+    state["draft_output"] = text
+    trace.append(text)
+    trace.append("╚══ [CHAIRMAN OF THE BOARD] Meeting adjourned ══╝")
+    return state
+
+
+def _step_maga_appointee(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowState:
+    """MAGA Appointee: deliver an America First, pro-deregulation, anti-globalist perspective."""
+    trace.append("\n╔══ [MAGA APPOINTEE] America First! ══╗")
+    content = (
+        f"User request: {state['user_request']}\n\n"
+        f"Planner instructions:\n{state['plan']}"
+    )
+    if state["revision_count"] > 0:
+        content += f"\n\nQA feedback to address:\n{state['qa_report']}"
+    text = _llm_call(chat_model, _MAGA_APPOINTEE_SYSTEM, content)
+    state["maga_appointee_output"] = text
+    state["draft_output"] = text
+    trace.append(text)
+    trace.append("╚══ [MAGA APPOINTEE] Done ══╝")
+    return state
+
+
+def _step_lawyer(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowState:
+    """Lawyer: analyse legal implications, liabilities, and compliance requirements."""
+    trace.append("\n╔══ [LAWYER] Reviewing legal implications... ══╗")
+    content = (
+        f"User request: {state['user_request']}\n\n"
+        f"Planner instructions:\n{state['plan']}"
+    )
+    if state["revision_count"] > 0:
+        content += f"\n\nQA feedback to address:\n{state['qa_report']}"
+    text = _llm_call(chat_model, _LAWYER_SYSTEM, content)
+    state["lawyer_output"] = text
+    state["draft_output"] = text
+    trace.append(text)
+    trace.append("╚══ [LAWYER] Done — note: this is not formal legal advice ══╝")
+    return state
+
+
 def _step_synthesize(
     chat_model,
     state: WorkflowState,
@@ -1089,6 +1321,12 @@ _SPECIALIST_STEPS = {
     "artist": _step_artist,
     "lazy_slacker": _step_lazy_slacker,
     "black_metal_fundamentalist": _step_black_metal_fundamentalist,
+    "labour_union_rep": _step_labour_union_rep,
+    "ux_designer": _step_ux_designer,
+    "doris": _step_doris,
+    "chairman_of_board": _step_chairman_of_board,
+    "maga_appointee": _step_maga_appointee,
+    "lawyer": _step_lawyer,
 }
 
 
@@ -1105,6 +1343,8 @@ _EMPTY_STATE_BASE: WorkflowState = {
     "research_output": "", "security_output": "", "data_analyst_output": "",
     "mad_professor_output": "", "accountant_output": "", "artist_output": "",
     "lazy_slacker_output": "", "black_metal_fundamentalist_output": "",
+    "labour_union_rep_output": "", "ux_designer_output": "", "doris_output": "",
+    "chairman_of_board_output": "", "maga_appointee_output": "", "lawyer_output": "",
     "synthesis_output": "",
     "draft_output": "", "qa_report": "", "qa_passed": False,
     "revision_count": 0, "final_answer": "",
@@ -1219,6 +1459,60 @@ def call_black_metal_fundamentalist(task: str) -> str:
     return state["black_metal_fundamentalist_output"]
 
 
+@tool
+def call_labour_union_rep(task: str) -> str:
+    """Call the Labour Union Representative to advocate for worker rights, fair wages, and job security."""
+    chat = build_provider_chat(_workflow_model_id)
+    state: WorkflowState = {**_EMPTY_STATE_BASE, "user_request": task, "plan": task, "current_role": "labour_union_rep"}
+    state = _step_labour_union_rep(chat, state, [])
+    return state["labour_union_rep_output"]
+
+
+@tool
+def call_ux_designer(task: str) -> str:
+    """Call the UX Designer to analyse user needs and produce a user-centric recommendation."""
+    chat = build_provider_chat(_workflow_model_id)
+    state: WorkflowState = {**_EMPTY_STATE_BASE, "user_request": task, "plan": task, "current_role": "ux_designer"}
+    state = _step_ux_designer(chat, state, [])
+    return state["ux_designer_output"]
+
+
+@tool
+def call_doris(task: str) -> str:
+    """Call Doris — well-meaning but clueless — for a rambling, off-topic perspective that misses the point entirely."""
+    chat = build_provider_chat(_workflow_model_id)
+    state: WorkflowState = {**_EMPTY_STATE_BASE, "user_request": task, "plan": task, "current_role": "doris"}
+    state = _step_doris(chat, state, [])
+    return state["doris_output"]
+
+
+@tool
+def call_chairman_of_board(task: str) -> str:
+    """Call the Chairman of the Board for a strategic, shareholder-focused, board-level perspective."""
+    chat = build_provider_chat(_workflow_model_id)
+    state: WorkflowState = {**_EMPTY_STATE_BASE, "user_request": task, "plan": task, "current_role": "chairman_of_board"}
+    state = _step_chairman_of_board(chat, state, [])
+    return state["chairman_of_board_output"]
+
+
+@tool
+def call_maga_appointee(task: str) -> str:
+    """Call the MAGA Appointee for an America First, pro-deregulation, anti-globalist perspective."""
+    chat = build_provider_chat(_workflow_model_id)
+    state: WorkflowState = {**_EMPTY_STATE_BASE, "user_request": task, "plan": task, "current_role": "maga_appointee"}
+    state = _step_maga_appointee(chat, state, [])
+    return state["maga_appointee_output"]
+
+
+@tool
+def call_lawyer(task: str) -> str:
+    """Call the Lawyer to analyse legal implications, liabilities, and compliance requirements. Not formal legal advice."""
+    chat = build_provider_chat(_workflow_model_id)
+    state: WorkflowState = {**_EMPTY_STATE_BASE, "user_request": task, "plan": task, "current_role": "lawyer"}
+    state = _step_lawyer(chat, state, [])
+    return state["lawyer_output"]
+
+
 # --- Orchestration loop ---
 
 def run_multi_role_workflow(
@@ -1259,6 +1553,7 @@ def run_multi_role_workflow(
     all_specialist_keys = [
         "creative", "technical", "research", "security", "data_analyst",
         "mad_professor", "accountant", "artist", "lazy_slacker", "black_metal_fundamentalist",
+        "labour_union_rep", "ux_designer", "doris", "chairman_of_board", "maga_appointee", "lawyer",
     ]
     active_specialist_keys = [k for k in all_specialist_keys if k in active_keys]
 
@@ -1282,6 +1577,12 @@ def run_multi_role_workflow(
         "artist_output": "",
         "lazy_slacker_output": "",
         "black_metal_fundamentalist_output": "",
+        "labour_union_rep_output": "",
+        "ux_designer_output": "",
+        "doris_output": "",
+        "chairman_of_board_output": "",
+        "maga_appointee_output": "",
+        "lawyer_output": "",
         "synthesis_output": "",
         "draft_output": "",
         "qa_report": "",
