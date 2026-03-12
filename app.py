@@ -1,4 +1,3 @@
-import json
 import os
 import re
 import uuid
@@ -7,7 +6,7 @@ import warnings
 import traceback
 from contextvars import ContextVar
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple, TypedDict
+from typing import Dict, List, Optional, Tuple, TypedDict
 
 import requests
 from dotenv import load_dotenv
@@ -500,12 +499,13 @@ TOOL_NAMES = list(ALL_TOOLS.keys())
 # Multi-role workflow — supervisor-style orchestration
 # ============================================================
 # Architecture:
-#   Planner → ALL active Specialists (sequentially) → Finalizer → QA Tester → Planner review
+#   Planner → ALL active Specialists (sequentially) → Synthesizer → QA Tester → Planner review
 #   The Planner breaks the task and picks a primary specialist.
 #   ALL active specialists then contribute their own perspective.
-#   The Finalizer synthesises all perspectives into the actual deliverable (not a meta-summary).
-#   If QA fails and retries remain, each specialist receives their previous output + QA feedback,
-#   and the loop repeats.  Best-artifact tracking ensures the best real deliverable is returned.
+#   The Synthesizer summarises every perspective, identifies common ground, and
+#   produces a single unified recommendation as the draft that goes to QA.
+#   If QA fails and retries remain, the Planner revises and loops again.
+#   If QA passes (or max retries are reached) the Planner approves a final answer.
 # ============================================================
 
 MAX_REVISIONS = 3  # Maximum QA-driven revision cycles before accepting best attempt
@@ -555,82 +555,47 @@ class WorkflowState(TypedDict):
     chairman_of_board_output: str
     maga_appointee_output: str
     lawyer_output: str
-    finalized_output: str   # deliverable produced by the Finalizer after all specialists
-    draft_output: str       # latest specialist/finalized output forwarded to QA
+    synthesis_output: str   # unified summary produced by the Synthesizer after all specialists
+    draft_output: str       # latest specialist/synthesis output forwarded to QA
     qa_report: str
-    qa_data: Dict[str, Any]  # parsed QA JSON data for structured access
-    qa_role_feedback: Dict[str, Any]  # role key → list[str] of targeted QA feedback items
+    qa_role_feedback: Dict[str, str]  # role key → targeted QA feedback for that specific role
     qa_passed: bool
     revision_count: int
-    best_artifact: str      # best non-empty real deliverable seen so far
-    best_artifact_score: float  # requirement-coverage score of best_artifact
     final_answer: str
 
 
 # --- Role system prompts ---
 
-# Role description snippets used to build the dynamic planner prompt
-_ROLE_DESCRIPTIONS: Dict[str, str] = {
-    "creative":                   "Creative Expert (ideas, framing, wording, brainstorming)",
-    "technical":                  "Technical Expert (code, architecture, implementation)",
-    "research":                   "Research Analyst (information gathering, literature review, fact-finding)",
-    "security":                   "Security Reviewer (security analysis, vulnerability checks, best practices)",
-    "data_analyst":               "Data Analyst (data analysis, statistics, pattern recognition, insights)",
-    "mad_professor":              "Mad Professor (radical scientific hypotheses, unhinged groundbreaking theories)",
-    "accountant":                 "Accountant (extreme cost scrutiny, ruthless cost-cutting, cheapest alternatives)",
-    "artist":                     "Artist (wildly unhinged creative vision, cosmic feeling and vibes)",
-    "lazy_slacker":               "Lazy Slacker (minimum viable effort, shortcuts, good-enough solutions)",
-    "black_metal_fundamentalist": "Black Metal Fundamentalist (nihilistic kvlt critique, rejection of mainstream approaches)",
-    "labour_union_rep":           "Labour Union Representative (worker rights, fair wages, job security)",
-    "ux_designer":                "UX Designer (user needs, user-centricity, usability, accessibility)",
-    "doris":                      "Doris (well-meaning but clueless, rambling, off-topic observations)",
-    "chairman_of_board":          "Chairman of the Board (corporate governance, shareholder value, strategic vision)",
-    "maga_appointee":             "MAGA Appointee (America First perspective, anti-globalism, deregulation)",
-    "lawyer":                     "Lawyer (legal compliance, liability, contracts, risk management)",
-}
-
-
-def _build_planner_system(active_specialist_keys: List[str]) -> str:
-    """Return a Planner system prompt that only lists *active* specialist roles.
-
-    This prevents the Planner from routing to roles that are not enabled in the
-    current run, which was a source of broken routing.
-    """
-    if not active_specialist_keys:
-        active_specialist_keys = list(_ROLE_DESCRIPTIONS.keys())
-
-    role_lines = "\n".join(
-        f"   - '{AGENT_ROLES.get(k, k)}'"
-        + (f" — {_ROLE_DESCRIPTIONS[k].split('(', 1)[1].rstrip(')')}" if k in _ROLE_DESCRIPTIONS else "")
-        for k in active_specialist_keys
-        if k in AGENT_ROLES
-    )
-    role_choices = " | ".join(
-        f"'{AGENT_ROLES.get(k, k)}'" for k in active_specialist_keys if k in AGENT_ROLES
-    )
-    return (
-        "You are the Planner in a multi-role AI workflow.\n"
-        "Your job is to:\n"
-        "1. Break the user's task into clear subtasks.\n"
-        "2. Decide which specialist to call as the PRIMARY lead "
-        "(choose ONLY from the active roles listed below):\n"
-        f"{role_lines}\n"
-        "3. State clear success criteria.\n\n"
-        "IMPORTANT: You MUST select the PRIMARY ROLE from the active roles listed above ONLY.\n"
-        "Do NOT invent or request roles that are not in this list.\n"
-        "ALL active specialists will also contribute their own perspective.\n"
-        "Your PRIMARY ROLE choice sets the lead voice, but every active role will be heard.\n\n"
-        "Respond in this exact format:\n"
-        "TASK BREAKDOWN:\n<subtask list>\n\n"
-        f"ROLE TO CALL: <{role_choices}>\n\n"
-        "SUCCESS CRITERIA:\n<what a correct, complete answer looks like>\n\n"
-        "GUIDANCE FOR SPECIALIST:\n<any constraints or focus areas>"
-    )
-
-
-# Fallback static planner system (used when active roles are not yet known)
-_PLANNER_SYSTEM = _build_planner_system(list(_ROLE_DESCRIPTIONS.keys()))
-
+_PLANNER_SYSTEM = (
+    "You are the Planner in a multi-role AI workflow.\n"
+    "Your job is to:\n"
+    "1. Break the user's task into clear subtasks.\n"
+    "2. Decide which specialist to call as the PRIMARY lead:\n"
+    "   - 'Creative Expert' (ideas, framing, wording, brainstorming)\n"
+    "   - 'Technical Expert' (code, architecture, implementation)\n"
+    "   - 'Research Analyst' (information gathering, literature review, fact-finding)\n"
+    "   - 'Security Reviewer' (security analysis, vulnerability checks, best practices)\n"
+    "   - 'Data Analyst' (data analysis, statistics, pattern recognition, insights)\n"
+    "   - 'Mad Professor' (radical scientific hypotheses, unhinged groundbreaking theories, extreme scientific speculation)\n"
+    "   - 'Accountant' (extreme cost scrutiny, ruthless cost-cutting, cheapest alternatives regardless of quality)\n"
+    "   - 'Artist' (wildly unhinged creative vision, cosmic feeling and vibes, impractical but spectacular ideas)\n"
+    "   - 'Lazy Slacker' (minimum viable effort, shortcuts, good-enough solutions, questioning whether anything needs to be done)\n"
+    "   - 'Black Metal Fundamentalist' (nihilistic kvlt critique, uncompromising rejection of mainstream approaches, raw truth)\n"
+    "   - 'Labour Union Representative' (worker rights, fair wages, job security, collective bargaining)\n"
+    "   - 'UX Designer' (user needs, user-centricity, usability, accessibility)\n"
+    "   - 'Doris' (well-meaning but clueless, rambling, off-topic observations)\n"
+    "   - 'Chairman of the Board' (corporate governance, shareholder value, strategic vision, fiduciary duty)\n"
+    "   - 'MAGA Appointee' (America First perspective, anti-globalism, deregulation, patriotism)\n"
+    "   - 'Lawyer' (legal compliance, liability, contracts, risk management)\n"
+    "3. State clear success criteria.\n\n"
+    "Note: ALL active specialists will also contribute their own perspective on the task.\n"
+    "Your PRIMARY ROLE choice sets the lead voice, but every active role will be heard.\n\n"
+    "Respond in this exact format:\n"
+    "TASK BREAKDOWN:\n<subtask list>\n\n"
+    "ROLE TO CALL: <Creative Expert | Technical Expert | Research Analyst | Security Reviewer | Data Analyst | Mad Professor | Accountant | Artist | Lazy Slacker | Black Metal Fundamentalist | Labour Union Representative | UX Designer | Doris | Chairman of the Board | MAGA Appointee | Lawyer>\n\n"
+    "SUCCESS CRITERIA:\n<what a correct, complete answer looks like>\n\n"
+    "GUIDANCE FOR SPECIALIST:\n<any constraints or focus areas>"
+)
 
 _CREATIVE_SYSTEM = (
     "You are the Creative Expert in a multi-role AI workflow.\n"
@@ -654,30 +619,17 @@ _TECHNICAL_SYSTEM = (
 
 _QA_SYSTEM = (
     "You are the QA Tester in a multi-role AI workflow.\n"
-    "Evaluate ONLY the finalized deliverable (not specialist process notes or summaries).\n"
-    "When individual specialist contributions are provided, give targeted, actionable feedback per role\n"
-    "so each specialist knows exactly what to fix in the next revision.\n\n"
-    "Respond with ONLY a valid JSON object in this exact format (no text before or after the JSON):\n"
-    "{\n"
-    '  "passed": false,\n'
-    '  "score": 0.0,\n'
-    '  "artifact_present": true,\n'
-    '  "missing_requirements": ["<specific missing item>"],\n'
-    '  "required_fixes": ["<concrete fix needed>"],\n'
-    '  "role_feedback": {\n'
-    '    "<role_key e.g. mad_professor>": ["<specific fix 1>", "<specific fix 2>"],\n'
-    '    "<role_key>": ["<fix>"] \n'
-    "  },\n"
-    '  "summary": "<one-sentence overall assessment>"\n'
-    "}\n\n"
-    'Set "passed" to true only if ALL requirements are met and missing_requirements is empty.\n'
-    'Set "score" to a float 0.0-1.0 representing how much of the deliverable is complete.\n'
-    'Set "artifact_present" to true if a real deliverable (not just meta-commentary) is present.\n'
-    'In "role_feedback", use the internal role key (e.g. "mad_professor", "artist", "technical") not the display name.\n'
-    'Each role_feedback value must be a list of specific, actionable fixes for that role.\n'
-    'Focus role_feedback on concrete missing content, not general style.\n'
-    'In "required_fixes", list the concrete changes needed to make the deliverable pass.\n'
-    'Evaluate ONLY the finalized deliverable under "Finalized deliverable:" — not the specialist inputs.'
+    "Check whether the output satisfies the original request and success criteria.\n"
+    "When individual specialist contributions are provided, give targeted feedback for each role\n"
+    "so they can refine their specific propositions in the next iteration.\n\n"
+    "Respond in this exact format:\n"
+    "REQUIREMENTS CHECKED:\n<list each requirement and whether it was met>\n\n"
+    "ISSUES FOUND:\n<defects or gaps — or 'None' if all requirements are met>\n\n"
+    "ROLE-SPECIFIC FEEDBACK:\n"
+    "<one bullet per specialist role that contributed, with targeted feedback on their contribution:\n"
+    " • Role Name: <specific feedback for that role to refine their proposition, or 'Satisfactory' if no issues>>\n\n"
+    "RESULT: <PASS | FAIL>\n\n"
+    "RECOMMENDED FIXES:\n<specific improvements — or 'None' if result is PASS>"
 )
 
 _PLANNER_REVIEW_SYSTEM = (
@@ -685,13 +637,11 @@ _PLANNER_REVIEW_SYSTEM = (
     "Based on the QA report, either approve the result or plan a revision.\n\n"
     "If QA PASSED, respond with:\n"
     "DECISION: APPROVED\n"
-    "FINAL ANSWER:\n<reproduce the complete finalized deliverable in full — the actual artifact, not a summary>\n\n"
+    "FINAL ANSWER:\n<the approved specialist output, reproduced in full>\n\n"
     "If QA FAILED, respond with:\n"
     "DECISION: REVISE\n"
     "ROLE TO CALL: <Creative Expert | Technical Expert | Research Analyst | Security Reviewer | Data Analyst | Mad Professor | Accountant | Artist | Lazy Slacker | Black Metal Fundamentalist | Labour Union Representative | UX Designer | Doris | Chairman of the Board | MAGA Appointee | Lawyer>\n"
-    "REVISED INSTRUCTIONS:\n<specific fixes the specialist must address>\n\n"
-    "IMPORTANT: When approving, reproduce the actual deliverable (e.g. the menu, the code, the plan) verbatim under FINAL ANSWER.\n"
-    "Do NOT write a summary or description of the deliverable — reproduce the deliverable itself."
+    "REVISED INSTRUCTIONS:\n<specific fixes the specialist must address>"
 )
 
 _RESEARCH_SYSTEM = (
@@ -797,22 +747,19 @@ _BLACK_METAL_FUNDAMENTALIST_SYSTEM = (
     "UNDERGROUND MANIFESTO DRAFT:\n<the complete output forged in darkness and uncompromising conviction>"
 )
 
-_FINALIZER_SYSTEM = (
-    "You are the Finalizer in a multi-role AI workflow.\n"
-    "You have received perspectives from multiple specialist roles on a task.\n"
-    "Your job is to produce the FINAL DELIVERABLE — the actual artifact the user requested.\n\n"
-    "CRITICAL RULES:\n"
-    "- Do NOT summarize what each specialist said.\n"
-    "- Do NOT list perspectives or write a report about the inputs.\n"
-    "- Do NOT write meta-commentary about the process.\n"
-    "- PRODUCE the complete, ready-to-use deliverable directly.\n\n"
-    "Examples:\n"
-    "- If the task asks for a menu → produce the actual menu with dishes and descriptions.\n"
-    "- If the task asks for code → produce the actual code.\n"
-    "- If the task asks for a plan → produce the actual step-by-step plan.\n"
-    "- If the task asks for a blog post → produce the actual blog post.\n\n"
-    "Synthesize the strongest insights from all specialist perspectives into the deliverable itself.\n"
-    "Output the final deliverable and nothing else."
+_SYNTHESIZER_SYSTEM = (
+    "You are the Synthesizer in a multi-role AI workflow.\n"
+    "You have received perspectives on a task from multiple specialist roles.\n"
+    "Your job is to:\n"
+    "1. Briefly summarise each specialist's key point or recommendation.\n"
+    "2. Identify themes, ideas, and recommendations that appear across multiple perspectives (common ground).\n"
+    "3. Acknowledge genuine differences or tensions between perspectives.\n"
+    "4. Produce a single, balanced, unified recommendation that draws on the strongest insights from all roles.\n\n"
+    "Respond in this exact format:\n"
+    "PERSPECTIVES SUMMARY:\n<one concise bullet per role: • Role Name — key point or recommendation>\n\n"
+    "COMMON GROUND:\n<shared themes, ideas, or approaches that multiple roles agree on>\n\n"
+    "TENSIONS AND TRADE-OFFS:\n<genuine disagreements or trade-offs between perspectives — or 'None' if all perspectives align>\n\n"
+    "UNIFIED RECOMMENDATION:\n<a balanced, synthesized answer that incorporates the strongest insights from all perspectives>"
 )
 
 _LABOUR_UNION_REP_SYSTEM = (
@@ -905,486 +852,169 @@ def _llm_call(chat_model, system_prompt: str, user_content: str) -> str:
     return content_to_text(response.content)
 
 
-def _decide_role(text: str, active_keys: Optional[List[str]] = None) -> str:
+def _decide_role(text: str) -> str:
     """Parse which specialist role the Planner wants to invoke.
 
-    Normalises the 'ROLE TO CALL:' line (strips surrounding whitespace and
-    collapses internal spaces) before matching, then falls back to a
-    word-boundary search.  Returns 'technical' when no clear signal is found.
-
-    When *active_keys* is provided the returned role key is guaranteed to be in
-    that set.  If the detected role is not active a deterministic fallback is
-    applied (first active key, or 'technical').
+    Checks for the expected structured 'ROLE TO CALL:' format first,
+    then falls back to a word-boundary search.
+    Defaults to 'technical' when no clear signal is found.
     """
-    # Normalise: collapse runs of whitespace so "ROLE  TO  CALL :  Creative Expert" still matches
-    normalised = re.sub(r"\s+", " ", text).strip()
-
-    # Ordered mapping: display label → role key (longest labels first to avoid partial matches)
-    _LABEL_TO_KEY_ORDERED = [
-        ("Black Metal Fundamentalist", "black_metal_fundamentalist"),
-        ("Labour Union Representative", "labour_union_rep"),
-        ("Chairman of the Board", "chairman_of_board"),
-        ("MAGA Appointee", "maga_appointee"),
-        ("Creative Expert", "creative"),
-        ("Technical Expert", "technical"),
-        ("Research Analyst", "research"),
-        ("Security Reviewer", "security"),
-        ("Data Analyst", "data_analyst"),
-        ("Mad Professor", "mad_professor"),
-        ("Accountant", "accountant"),
-        ("Lazy Slacker", "lazy_slacker"),
-        ("UX Designer", "ux_designer"),
-        ("Artist", "artist"),
-        ("Lawyer", "lawyer"),
-        ("Doris", "doris"),
-    ]
-    detected: Optional[str] = None
-    for label, key in _LABEL_TO_KEY_ORDERED:
-        # Match "ROLE TO CALL: <label>" with optional surrounding whitespace
-        if re.search(r"ROLE\s+TO\s+CALL\s*:\s*" + re.escape(label), normalised, re.IGNORECASE):
-            detected = key
-            break
-
-    if detected is None:
-        # Fallback: word-boundary match on the full (normalised) text
-        _WORD_FALLBACKS = [
-            (r"\bcreative\b", "creative"),
-            (r"\bresearch\b", "research"),
-            (r"\bsecurity\b", "security"),
-            (r"\bdata\s+analyst\b", "data_analyst"),
-            (r"\bmad\s+professor\b", "mad_professor"),
-            (r"\baccountant\b", "accountant"),
-            (r"\bartist\b", "artist"),
-            (r"\blazy\s+slacker\b", "lazy_slacker"),
-            (r"\bblack\s+metal\b", "black_metal_fundamentalist"),
-            (r"\blabour\s+union\b", "labour_union_rep"),
-            (r"\bux\s+designer\b", "ux_designer"),
-            (r"\bdoris\b", "doris"),
-            (r"\bchairman\b", "chairman_of_board"),
-            (r"\bmaga\b", "maga_appointee"),
-            (r"\blawyer\b", "lawyer"),
-        ]
-        for pattern, key in _WORD_FALLBACKS:
-            if re.search(pattern, normalised, re.IGNORECASE):
-                detected = key
-                break
-
-    detected = detected or "technical"
-
-    # Filter to active keys when provided
-    if active_keys:
-        if detected not in active_keys:
-            fallback = active_keys[0] if active_keys else "technical"
-            return fallback
-    return detected
-
-
-def _parse_qa_json(qa_text: str) -> Optional[Dict[str, Any]]:
-    """Attempt to parse QA output as a JSON object.
-
-    Tries to extract a JSON object from the raw QA text, which may contain
-    surrounding prose or markdown fences.  Returns None if parsing fails.
-    """
-    # Strip optional markdown code fences
-    stripped = re.sub(r"```(?:json)?", "", qa_text).strip()
-    # Try direct parse first
-    try:
-        return json.loads(stripped)
-    except (json.JSONDecodeError, ValueError):
-        pass
-    # Extract the first {...} block (greedy across newlines)
-    match = re.search(r"\{.*\}", stripped, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group())
-        except (json.JSONDecodeError, ValueError):
-            pass
-    return None
+    # Prefer the explicit structured label produced by the Planner prompt
+    if "ROLE TO CALL: Creative Expert" in text:
+        return "creative"
+    if "ROLE TO CALL: Technical Expert" in text:
+        return "technical"
+    if "ROLE TO CALL: Research Analyst" in text:
+        return "research"
+    if "ROLE TO CALL: Security Reviewer" in text:
+        return "security"
+    if "ROLE TO CALL: Data Analyst" in text:
+        return "data_analyst"
+    if "ROLE TO CALL: Mad Professor" in text:
+        return "mad_professor"
+    if "ROLE TO CALL: Accountant" in text:
+        return "accountant"
+    if "ROLE TO CALL: Artist" in text:
+        return "artist"
+    if "ROLE TO CALL: Lazy Slacker" in text:
+        return "lazy_slacker"
+    if "ROLE TO CALL: Black Metal Fundamentalist" in text:
+        return "black_metal_fundamentalist"
+    if "ROLE TO CALL: Labour Union Representative" in text:
+        return "labour_union_rep"
+    if "ROLE TO CALL: UX Designer" in text:
+        return "ux_designer"
+    if "ROLE TO CALL: Doris" in text:
+        return "doris"
+    if "ROLE TO CALL: Chairman of the Board" in text:
+        return "chairman_of_board"
+    if "ROLE TO CALL: MAGA Appointee" in text:
+        return "maga_appointee"
+    if "ROLE TO CALL: Lawyer" in text:
+        return "lawyer"
+    # Fallback: word-boundary match
+    if re.search(r"\bcreative\b", text, re.IGNORECASE):
+        return "creative"
+    if re.search(r"\bresearch\b", text, re.IGNORECASE):
+        return "research"
+    if re.search(r"\bsecurity\b", text, re.IGNORECASE):
+        return "security"
+    if re.search(r"\bdata\s+analyst\b", text, re.IGNORECASE):
+        return "data_analyst"
+    if re.search(r"\bmad\s+professor\b", text, re.IGNORECASE):
+        return "mad_professor"
+    if re.search(r"\baccountant\b", text, re.IGNORECASE):
+        return "accountant"
+    if re.search(r"\bartist\b", text, re.IGNORECASE):
+        return "artist"
+    if re.search(r"\blazy\s+slacker\b", text, re.IGNORECASE):
+        return "lazy_slacker"
+    if re.search(r"\bblack\s+metal\b", text, re.IGNORECASE):
+        return "black_metal_fundamentalist"
+    if re.search(r"\blabour\s+union\b", text, re.IGNORECASE):
+        return "labour_union_rep"
+    if re.search(r"\bux\s+designer\b", text, re.IGNORECASE):
+        return "ux_designer"
+    if re.search(r"\bdoris\b", text, re.IGNORECASE):
+        return "doris"
+    if re.search(r"\bchairman\b", text, re.IGNORECASE):
+        return "chairman_of_board"
+    if re.search(r"\bmaga\b", text, re.IGNORECASE):
+        return "maga_appointee"
+    if re.search(r"\blawyer\b", text, re.IGNORECASE):
+        return "lawyer"
+    return "technical"
 
 
 def _qa_passed_check(qa_text: str) -> bool:
     """Return True only if the QA report contains an explicit PASS result.
 
-    Handles both the new format (``passed`` bool + ``score``) and the legacy
-    format (``result: PASS|FAIL``).  Returns False when the expected format is
-    absent to avoid false positives from words like 'bypass' or 'password'.
+    Relies on the structured 'RESULT: PASS / RESULT: FAIL' line produced by
+    the QA Tester prompt.  Returns False when the expected format is absent
+    to avoid false positives from words like 'bypass' or 'password'.
     """
-    data = _parse_qa_json(qa_text)
-    if data is not None:
-        # New format: "passed" bool field
-        if "passed" in data:
-            return bool(data["passed"])
-        # Legacy format: "result" string field
-        result = str(data.get("result", "")).strip().upper()
-        if result == "PASS":
-            return True
-        if result == "FAIL":
-            return False
-    # Plain-text fallback (legacy format and defensive safety net)
     lower = qa_text.lower()
-    if "\"result\": \"pass\"" in lower or "result: pass" in lower:
+    if "result: pass" in lower:
         return True
-    if "\"result\": \"fail\"" in lower or "result: fail" in lower:
+    if "result: fail" in lower:
         return False
+    # No recognised verdict — treat as fail to avoid accepting a bad draft
     return False
 
 
-def _parse_qa_role_feedback(qa_text: str) -> Dict[str, Any]:
+def _parse_qa_role_feedback(qa_text: str) -> Dict[str, str]:
     """Extract per-role targeted feedback from a QA report.
 
-    Supports the new format where each role maps to a list of strings, and the
-    legacy format where each role maps to a single string.  Also accepts role
-    keys (e.g. 'mad_professor') directly in addition to display labels.
-
-    Returns a dict mapping role keys (e.g. 'creative', 'technical') to either
-    a list of fix strings (new format) or a plain string (legacy format).
+    Looks for the ROLE-SPECIFIC FEEDBACK section produced by the QA Tester
+    and parses bullet entries of the form '• Role Name: <feedback>'.
+    Returns a dict mapping role keys (e.g. 'creative', 'technical') to the
+    feedback string targeted at that role.
     """
-    feedback: Dict[str, Any] = {}
-
-    # JSON path — handles both new (list) and legacy (string) values
-    data = _parse_qa_json(qa_text)
-    if data is not None and isinstance(data.get("role_feedback"), dict):
-        for label_or_key, fb in data["role_feedback"].items():
-            label_or_key = str(label_or_key).strip()
-            # Try direct role key first, then display-label lookup
-            if label_or_key in AGENT_ROLES:
-                role_key = label_or_key
-            else:
-                role_key = _ROLE_LABEL_TO_KEY.get(label_or_key)
-            if role_key and fb:
-                # Normalise to list for consistent downstream use
-                if isinstance(fb, list):
-                    feedback[role_key] = [str(x).strip() for x in fb if x]
-                else:
-                    feedback[role_key] = [str(fb).strip()]
-        return feedback
-
-    # Legacy text fallback
+    feedback: Dict[str, str] = {}
     if "ROLE-SPECIFIC FEEDBACK:" not in qa_text:
         return feedback
+
+    # Extract the section between ROLE-SPECIFIC FEEDBACK: and the next header
     section = qa_text.split("ROLE-SPECIFIC FEEDBACK:", 1)[1]
     for header in ("RESULT:", "RECOMMENDED FIXES:"):
         if header in section:
             section = section.split(header, 1)[0]
             break
+
+    # Parse bullet lines: • Role Name: <feedback text>
     for line in section.strip().splitlines():
         line = line.strip().lstrip("•-* ")
         if ":" not in line:
             continue
-        role_label, _, role_fb = line.partition(":")
+        role_label, _, role_feedback = line.partition(":")
         role_label = role_label.strip()
-        role_fb = role_fb.strip()
+        role_feedback = role_feedback.strip()
         role_key = _ROLE_LABEL_TO_KEY.get(role_label)
-        if role_key and role_fb:
-            feedback[role_key] = [role_fb]
+        if role_key and role_feedback:
+            feedback[role_key] = role_feedback
 
     return feedback
-
-
-# Meta-summary detector: returns True when text looks like a synthesis report
-# rather than an actual deliverable (menu, code, plan, etc.)
-_META_SUMMARY_SIGNALS = [
-    "PERSPECTIVES SUMMARY:", "UNIFIED RECOMMENDATION:", "COMMON GROUND:",
-    "TENSIONS AND TRADE-OFFS:", "ROLE-SPECIFIC FEEDBACK:", "REQUIREMENTS CHECKED:",
-    "ISSUES FOUND:", "RECOMMENDED FIXES:", "BOARD PERSPECTIVE:", "UNION CONCERNS:",
-    "KVLT VERDICT:", "COSMIC VISION:", "WILD HYPOTHESIS:",
-]
-
-
-def _is_meta_summary(text: str) -> bool:
-    """Return True if *text* looks like a meta-summary / process report rather
-    than an actual deliverable.  Requires at least two recognised header signals
-    to avoid false positives on content that merely mentions one of the terms.
-    """
-    if not text:
-        return False
-    upper = text.upper()
-    count = sum(1 for signal in _META_SUMMARY_SIGNALS if signal in upper)
-    return count >= 2
-
-
-# ─── Output quality helpers ───────────────────────────────────────────────────
-
-# Persona-heavy roles that need revision-mode behaviour enforcement
-_PERSONA_ROLE_KEYS = frozenset({
-    "mad_professor", "artist", "lazy_slacker",
-    "black_metal_fundamentalist", "doris", "maga_appointee",
-})
-
-# Heuristics that suggest a real, structured deliverable
-_DELIVERABLE_SIGNALS = [
-    r"(?:option|choice|step|ingredient|method|approach|alternative)\s*\d*\s*[:\-]",
-    r"^\s*\d+[\.\)]\s+\w+",      # numbered list item
-    r"^#{1,3}\s+\w+",             # markdown header
-    r"\*\*[^\*]+\*\*",            # bold text
-    r"^\s*[-•]\s+\w+",            # bullet point
-    r"\b(?:recipe|menu|plan|schedule|budget|code|function|class|def |import )\b",
-]
-
-
-def _is_empty_output(text: str) -> bool:
-    """Return True when *text* is blank or shorter than a minimal threshold."""
-    return not text or len(text.strip()) < 30
-
-
-def _is_relevant_to_request(text: str, request: str) -> bool:
-    """Return True when *text* shares enough key words with *request*.
-
-    Uses a simple word-overlap heuristic: at least 25 % of significant words
-    from the request must appear somewhere in the output.
-    """
-    if not text or not request:
-        return False
-    request_words = {w.lower() for w in re.findall(r"\b\w{4,}\b", request)}
-    if not request_words:
-        return True
-    text_lower = text.lower()
-    overlap = sum(1 for w in request_words if w in text_lower)
-    return overlap / len(request_words) >= 0.25
-
-
-def _looks_like_actionable_deliverable(text: str) -> bool:
-    """Return True when *text* shows structural markers typical of a real deliverable."""
-    if not text or len(text.strip()) < 50:
-        return False
-    text_lower = text.lower()
-    matches = sum(
-        1 for sig in _DELIVERABLE_SIGNALS
-        if re.search(sig, text_lower, re.MULTILINE | re.IGNORECASE)
-    )
-    return matches >= 2
-
-
-def _score_candidate(text: str, requirements: List[str], request: str) -> float:
-    """Score an output 0.0-1.0 against requirement coverage + structural quality.
-
-    Combines:
-    - Fraction of explicit requirements whose key words appear in the text (60 %)
-    - Whether the text looks like an actionable deliverable (20 %)
-    - Whether the text is relevant to the request (20 %)
-    """
-    if not text or not text.strip():
-        return 0.0
-
-    req_score = 0.0
-    if requirements:
-        text_lower = text.lower()
-        covered = sum(
-            1 for req in requirements
-            if any(w in text_lower for w in re.findall(r"\b\w{3,}\b", req.lower()))
-        )
-        req_score = covered / len(requirements)
-
-    deliverable_score = 1.0 if _looks_like_actionable_deliverable(text) else 0.0
-    relevance_score = 1.0 if _is_relevant_to_request(text, request) else 0.0
-
-    return 0.6 * req_score + 0.2 * deliverable_score + 0.2 * relevance_score
-
-
-def _format_role_feedback_for_prompt(feedback: Any) -> str:
-    """Render QA role feedback (list or string) as a readable string for prompts."""
-    if isinstance(feedback, list):
-        return "\n".join(f"- {item}" for item in feedback if item)
-    return str(feedback).strip()
-
-
-def _strict_retry_specialist(
-    chat_model,
-    system_prompt: str,
-    state: "WorkflowState",
-    role_key: str,
-    output_key: str,
-    label: str,
-    trace: List[str],
-) -> str:
-    """Re-invoke a specialist with a strict, no-theatrics prompt after a poor output.
-
-    Returns the new output text (may still be empty/poor; callers should check).
-    """
-    previous_output = state.get(output_key, "")  # type: ignore[literal-required]
-    qa_data = state.get("qa_data") or {}
-    fixes = qa_data.get("required_fixes") or qa_data.get("recommended_fixes") or []
-    role_fb = state["qa_role_feedback"].get(role_key)
-
-    strict_content = (
-        f"User request: {state['user_request']}\n\n"
-        f"Planner instructions:\n{state['plan']}\n\n"
-        "STRICT RETRY: Your previous response did not satisfy the task requirements.\n"
-        "Drop persona theatrics entirely. Provide directly usable, task-relevant content.\n"
-        "Address every required fix listed below. Return the deliverable content only — "
-        "no explanations of what you are about to do, no process notes.\n\n"
-    )
-    if fixes:
-        strict_content += "Required fixes:\n" + "\n".join(f"- {f}" for f in fixes) + "\n\n"
-    if role_fb:
-        strict_content += "Role-specific fixes:\n" + _format_role_feedback_for_prompt(role_fb) + "\n\n"
-    if previous_output:
-        strict_content += f"Your previous (unsatisfactory) output:\n{previous_output}\n\n"
-    strict_content += "Now produce the corrected, improved deliverable:"
-
-    trace.append(f"  ↩ [{label}] strict retry invoked.")
-    new_output = _llm_call(chat_model, system_prompt, strict_content)
-    trace.append(f"  ✔ [{label}] strict retry complete ({len(new_output)} chars).")
-    return new_output
 
 
 # --- Workflow step functions ---
 # Each step receives the shared state and an append-only trace list,
 # updates state in place, appends log lines, and returns updated state.
 
-def _step_plan(
-    chat_model,
-    state: WorkflowState,
-    trace: List[str],
-    active_specialist_keys: Optional[List[str]] = None,
-) -> WorkflowState:
-    """Planner: analyse the task, produce a plan, decide which specialist to call.
-
-    Uses a dynamically generated system prompt that lists ONLY the active
-    specialist roles, preventing routing to inactive roles.
-    """
+def _step_plan(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowState:
+    """Planner: analyse the task, produce a plan, decide which specialist to call."""
     trace.append("\n╔══ [PLANNER] Analysing task... ══╗")
-    planner_system = _build_planner_system(active_specialist_keys or [])
     content = f"User request: {state['user_request']}"
     if state["revision_count"] > 0:
-        # Use structured QA data when available for clearer revision guidance
-        qa_data = state.get("qa_data") or {}
-        missing = qa_data.get("missing_requirements") or []
-        fixes = qa_data.get("required_fixes") or qa_data.get("recommended_fixes") or []
-        score = qa_data.get("score", "?")
-        summary = qa_data.get("summary", "")
-        if missing or fixes:
-            qa_summary = ""
-            if summary:
-                qa_summary += f"QA summary (score {score}): {summary}\n\n"
-            if missing:
-                qa_summary += "Missing requirements:\n" + "\n".join(f"- {m}" for m in missing) + "\n\n"
-            if fixes:
-                qa_summary += "Required fixes:\n" + "\n".join(f"- {f}" for f in fixes)
-        else:
-            qa_summary = state["qa_report"]
-        # Identify which role produced the best content (prefer routing to it)
-        best_note = ""
-        if state.get("best_artifact") and not _is_meta_summary(state["best_artifact"]):
-            best_note = "\nNOTE: A good concrete artifact was found in a previous round. Route to the role most likely to improve on it."
         content += (
             f"\n\nThis is revision {state['revision_count']} of {MAX_REVISIONS}."
-            f"\nQA concerns to address:\n{qa_summary}"
-            f"{best_note}"
-            "\nChoose the role most likely to produce the ACTUAL DELIVERABLE that addresses these concerns."
-            "\nRemember to select ONLY from the active roles listed in your instructions."
+            f"\nPrevious QA report:\n{state['qa_report']}"
+            "\nAdjust the plan to address the QA issues."
         )
-    plan_text = _llm_call(chat_model, planner_system, content)
+    plan_text = _llm_call(chat_model, _PLANNER_SYSTEM, content)
     state["plan"] = plan_text
-    state["current_role"] = _decide_role(plan_text, active_keys=active_specialist_keys)
-    role_label = AGENT_ROLES.get(state["current_role"], state["current_role"]).upper()
+    state["current_role"] = _decide_role(plan_text)
     trace.append(plan_text)
-    trace.append(f"╚══ [PLANNER] → routing to: {role_label} ══╝")
-    return state
-
-
-
-def _build_specialist_content(
-    state: WorkflowState,
-    role_key: str,
-    previous_output_key: str,
-    strict: bool = False,
-) -> str:
-    """Build the user-facing content string for a specialist LLM call.
-
-    On the first pass this is just the request + plan.
-    On revision passes it additionally includes:
-    - Explicit revision-mode prompt contract
-    - The specialist's own previous output
-    - The previous finalizer output (so specialists can see the last merged answer)
-    - Structured QA feedback: global required_fixes + role-specific fixes
-    - A note if persona mode should be suppressed (persona roles only)
-    When *strict* is True the tone is even more direct (used by retry logic).
-    """
-    revision = state["revision_count"]
-    content = (
-        f"User request: {state['user_request']}\n\n"
-        f"Planner instructions:\n{state['plan']}"
-    )
-
-    if revision > 0:
-        # ── Revision-mode prompt contract ────────────────────────────────────
-        contract = (
-            f"\n\n{'─'*60}\n"
-            f"REVISION {revision} of {MAX_REVISIONS} — REVISION MODE ACTIVE\n"
-            "You are revising your previous contribution.\n"
-            "Fix the specific issues identified by QA.\n"
-            "Return ONLY the improved content for your role.\n"
-            "Do NOT return commentary, summaries of opinions, or statements about "
-            "what you plan to do.\n"
-        )
-        if role_key in _PERSONA_ROLE_KEYS and not strict:
-            contract += (
-                "PERSONA NOTE: Keep your characteristic voice for style only. "
-                "In revision mode you MUST prioritise usefulness and requirement "
-                "satisfaction over persona performance. "
-                "Limit persona intro text. Provide concrete deliverable content first.\n"
-            )
-        if strict:
-            contract += (
-                "STRICT RETRY: Your previous response failed quality checks. "
-                "Drop all persona theatrics. Produce directly usable content only.\n"
-            )
-        contract += "─" * 60
-        content += contract
-
-        # ── Previous finalizer output ─────────────────────────────────────────
-        prev_final = state.get("finalized_output", "")
-        if prev_final and not _is_meta_summary(prev_final):
-            content += f"\n\nPrevious finalizer output (the merged answer from last round):\n{short_text(prev_final, 800)}"
-
-        # ── This role's own previous output ──────────────────────────────────
-        previous_output = state.get(previous_output_key, "")  # type: ignore[literal-required]
-        if previous_output:
-            content += f"\n\nYour previous output (revise and improve this):\n{previous_output}"
-
-        # ── QA feedback ───────────────────────────────────────────────────────
-        qa_data = state.get("qa_data") or {}
-        required_fixes = qa_data.get("required_fixes") or qa_data.get("recommended_fixes") or []
-        missing = qa_data.get("missing_requirements") or []
-        role_feedback = state["qa_role_feedback"].get(role_key)
-
-        if role_feedback:
-            fb_text = _format_role_feedback_for_prompt(role_feedback)
-            content += f"\n\nQA feedback specific to your role — address each item:\n{fb_text}"
-        if missing:
-            content += "\n\nMissing requirements to add:\n" + "\n".join(f"- {m}" for m in missing)
-        if required_fixes:
-            content += "\n\nRequired fixes from QA:\n" + "\n".join(f"- {f}" for f in required_fixes)
-        if not role_feedback and not required_fixes and not missing and state["qa_report"]:
-            # Fallback: include score/summary from QA report
-            score = qa_data.get("score", "")
-            summary = qa_data.get("summary", "")
-            if summary:
-                content += f"\n\nQA summary (score {score}): {summary}"
-
-    return content
-
-
-def _record_specialist_output(
-    state: WorkflowState, role_key: str, output_key: str, text: str, trace: List[str], label: str
-) -> WorkflowState:
-    """Store specialist output, warn on empty, and always set draft_output."""
-    if not text or not text.strip():
-        trace.append(f"  ⚠ [{label}] returned empty output — keeping previous draft.")
-        text = state.get("draft_output", "") or f"[{label}: no output produced]"  # type: ignore[literal-required]
-    state[output_key] = text  # type: ignore[literal-required]
-    state["draft_output"] = text
+    trace.append(f"╚══ [PLANNER] → routing to: {state['current_role'].upper()} EXPERT ══╝")
     return state
 
 
 def _step_creative(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowState:
     """Creative Expert: brainstorm ideas and produce a recommended draft."""
     trace.append("\n╔══ [CREATIVE EXPERT] Generating ideas... ══╗")
-    content = _build_specialist_content(state, "creative", "creative_output")
+    content = (
+        f"User request: {state['user_request']}\n\n"
+        f"Planner instructions:\n{state['plan']}"
+    )
+    if state["revision_count"] > 0:
+        role_feedback = state["qa_role_feedback"].get("creative", "")
+        if role_feedback:
+            content += f"\n\nQA feedback specific to your contribution:\n{role_feedback}"
+        else:
+            content += f"\n\nQA feedback to address:\n{state['qa_report']}"
     text = _llm_call(chat_model, _CREATIVE_SYSTEM, content)
-    state = _record_specialist_output(state, "creative", "creative_output", text, trace, "CREATIVE EXPERT")
-    trace.append(state["creative_output"])
+    state["creative_output"] = text
+    state["draft_output"] = text
+    trace.append(text)
     trace.append("╚══ [CREATIVE EXPERT] Done ══╝")
     return state
 
@@ -1392,10 +1022,20 @@ def _step_creative(chat_model, state: WorkflowState, trace: List[str]) -> Workfl
 def _step_technical(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowState:
     """Technical Expert: provide implementation details and a complete technical draft."""
     trace.append("\n╔══ [TECHNICAL EXPERT] Working on implementation... ══╗")
-    content = _build_specialist_content(state, "technical", "technical_output")
+    content = (
+        f"User request: {state['user_request']}\n\n"
+        f"Planner instructions:\n{state['plan']}"
+    )
+    if state["revision_count"] > 0:
+        role_feedback = state["qa_role_feedback"].get("technical", "")
+        if role_feedback:
+            content += f"\n\nQA feedback specific to your contribution:\n{role_feedback}"
+        else:
+            content += f"\n\nQA feedback to address:\n{state['qa_report']}"
     text = _llm_call(chat_model, _TECHNICAL_SYSTEM, content)
-    state = _record_specialist_output(state, "technical", "technical_output", text, trace, "TECHNICAL EXPERT")
-    trace.append(state["technical_output"])
+    state["technical_output"] = text
+    state["draft_output"] = text
+    trace.append(text)
     trace.append("╚══ [TECHNICAL EXPERT] Done ══╝")
     return state
 
@@ -1406,93 +1046,52 @@ def _step_qa(
     trace: List[str],
     all_outputs: Optional[List[Tuple[str, str]]] = None,
 ) -> WorkflowState:
-    """QA Tester: check the FINALIZED deliverable against the original request.
+    """QA Tester: check the draft against the original request and success criteria.
 
-    Evaluates ``state['draft_output']`` (the finalizer output), not individual
-    specialist contributions.  Individual specialist outputs are still passed
-    so QA can supply targeted, per-role feedback stored in
-    ``state['qa_role_feedback']`` for the next revision pass.
-
-    Logs exactly what text was evaluated, the score, and the missing requirements.
+    When *all_outputs* is provided (list of (role_key, output) pairs from this
+    iteration), each specialist's individual contribution is included in the
+    review prompt so the QA can supply targeted, per-role feedback.  This
+    feedback is stored in ``state['qa_role_feedback']`` and consumed by the
+    specialist step functions on the next revision pass.
     """
-    trace.append("\n╔══ [QA TESTER] Reviewing finalized deliverable... ══╗")
-    evaluated_text = state["draft_output"]
-    trace.append(f"  ℹ QA evaluating: {len(evaluated_text)} chars of finalized output")
-
+    trace.append("\n╔══ [QA TESTER] Reviewing output... ══╗")
     content = (
         f"Original user request: {state['user_request']}\n\n"
         f"Planner's plan and success criteria:\n{state['plan']}\n\n"
     )
     if all_outputs:
-        # Include specialist contributions for role-specific feedback only
-        content += "Individual specialist contributions (for per-role feedback only):\n\n"
+        # Include each specialist's individual output so QA can give role-specific feedback
+        content += "Individual specialist contributions:\n\n"
         for r_key, r_output in all_outputs:
             r_label = AGENT_ROLES.get(r_key, r_key)
-            content += f"=== {r_label} (role key: {r_key}) ===\n{short_text(r_output, 600)}\n\n"
-    content += f"Finalized deliverable (evaluate this for PASS/FAIL):\n{evaluated_text}"
-
+            content += f"=== {r_label} ===\n{r_output}\n\n"
+        content += f"Synthesized unified output:\n{state['draft_output']}"
+    else:
+        content += f"Specialist output to review:\n{state['draft_output']}"
     text = _llm_call(chat_model, _QA_SYSTEM, content)
     state["qa_report"] = text
-    state["qa_data"] = _parse_qa_json(text) or {}
     state["qa_role_feedback"] = _parse_qa_role_feedback(text)
     state["qa_passed"] = _qa_passed_check(text)
-
-    qa_data = state["qa_data"]
-    score = qa_data.get("score", "?")
-    artifact_present = qa_data.get("artifact_present", "?")
-    missing = qa_data.get("missing_requirements") or []
     result_label = "✅ PASS" if state["qa_passed"] else "❌ FAIL"
-
     trace.append(text)
-    trace.append(
-        f"  ℹ QA result: {result_label} | score: {score} | artifact_present: {artifact_present}"
-    )
-    if missing:
-        trace.append("  ℹ Missing requirements: " + "; ".join(str(m) for m in missing[:5]))
     if state["qa_role_feedback"]:
-        fb_parts = []
-        for k, v in state["qa_role_feedback"].items():
-            preview = (v[0][:60] + "…") if isinstance(v, list) and v else (str(v)[:60])
-            fb_parts.append(f"{AGENT_ROLES.get(k, k)}: {preview}")
-        trace.append(f"  ℹ Role-specific feedback dispatched → {', '.join(fb_parts)}")
+        feedback_summary = ", ".join(
+            f"{AGENT_ROLES.get(k, k)}: {v[:60]}{'…' if len(v) > 60 else ''}"
+            for k, v in state["qa_role_feedback"].items()
+        )
+        trace.append(f"  ℹ Role-specific feedback dispatched → {feedback_summary}")
     trace.append(f"╚══ [QA TESTER] Result: {result_label} ══╝")
     return state
 
 
-def _step_planner_review(
-    chat_model,
-    state: WorkflowState,
-    trace: List[str],
-    active_specialist_keys: Optional[List[str]] = None,
-) -> WorkflowState:
+def _step_planner_review(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowState:
     """Planner: review QA feedback and either approve the result or request a revision."""
     trace.append("\n╔══ [PLANNER] Reviewing QA feedback... ══╗")
-    # Format issues/fixes from structured QA data when available
-    qa_data = state.get("qa_data") or {}
-    missing = qa_data.get("missing_requirements") or []
-    fixes = qa_data.get("required_fixes") or qa_data.get("recommended_fixes") or []
-    score = qa_data.get("score", "?")
-    summary = qa_data.get("summary", "")
-    if missing or fixes:
-        qa_summary = ""
-        if summary:
-            qa_summary += f"QA summary (score {score}): {summary}\n\n"
-        if missing:
-            qa_summary += "Missing requirements:\n" + "\n".join(f"- {m}" for m in missing) + "\n\n"
-        if fixes:
-            qa_summary += "Required fixes:\n" + "\n".join(f"- {f}" for f in fixes)
-    else:
-        qa_summary = state["qa_report"]
-
-    # Use best artifact for approval check, not just the latest draft
-    deliverable = state.get("best_artifact") or state["draft_output"]
-
     content = (
         f"User request: {state['user_request']}\n\n"
         f"Plan:\n{state['plan']}\n\n"
-        f"Current deliverable:\n{deliverable}\n\n"
-        f"QA result: {'PASS' if state['qa_passed'] else 'FAIL'}\n"
-        f"QA details:\n{qa_summary}"
+        f"Specialist output:\n{state['draft_output']}\n\n"
+        f"QA report:\n{state['qa_report']}"
     )
     review = _llm_call(chat_model, _PLANNER_REVIEW_SYSTEM, content)
     trace.append(review)
@@ -1501,48 +1100,44 @@ def _step_planner_review(
         # Extract the final answer that the Planner reproduced in full
         parts = review.split("FINAL ANSWER:", 1)
         if len(parts) > 1:
-            candidate = parts[1].strip()
-            # Guard: if the planner just reproduced a meta-summary, use the best artifact instead
-            if _is_meta_summary(candidate) and state.get("best_artifact"):
-                trace.append("  ⚠ Planner FINAL ANSWER looks like a meta-summary — using best artifact instead.")
-                state["final_answer"] = state["best_artifact"]
-            else:
-                state["final_answer"] = candidate
+            state["final_answer"] = parts[1].strip()
         else:
-            # Planner approved but omitted the expected FINAL ANSWER section — use best artifact
-            trace.append("  ⚠ FINAL ANSWER section missing; using best artifact as final answer.")
-            state["final_answer"] = state.get("best_artifact") or state["draft_output"]
+            # Planner approved but omitted the expected FINAL ANSWER section — use draft
+            trace.append("  ⚠ FINAL ANSWER section missing; using specialist draft as final answer.")
+            state["final_answer"] = state["draft_output"]
         trace.append("╚══ [PLANNER] → ✅ APPROVED ══╝")
     else:
         # Planner requests a revision — update plan with revised instructions
         parts = review.split("REVISED INSTRUCTIONS:", 1)
         if len(parts) > 1:
             state["plan"] = parts[1].strip()
-            trace.append("  ℹ Revised instructions extracted from Planner response.")
         else:
             # Revision requested but REVISED INSTRUCTIONS section missing — keep current plan
             trace.append("  ⚠ REVISED INSTRUCTIONS section missing; retrying with existing plan.")
-        new_role = _decide_role(review, active_keys=active_specialist_keys)
-        # If the new role was inactive (fallback triggered), log it clearly
-        if active_specialist_keys and new_role not in active_specialist_keys:
-            fallback = active_specialist_keys[0]
-            trace.append(f"  ⚠ Planner requested inactive role → falling back to {AGENT_ROLES.get(fallback, fallback).upper()}")
-            new_role = fallback
-        state["current_role"] = new_role
+        state["current_role"] = _decide_role(review)
         trace.append(
-            f"╚══ [PLANNER] → 🔄 REVISE — routing to {AGENT_ROLES.get(new_role, new_role).upper()} ══╝"
+            f"╚══ [PLANNER] → 🔄 REVISE — routing to {state['current_role'].upper()} EXPERT ══╝"
         )
     return state
-
 
 
 def _step_research(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowState:
     """Research Analyst: gather information and produce a comprehensive research summary."""
     trace.append("\n╔══ [RESEARCH ANALYST] Gathering information... ══╗")
-    content = _build_specialist_content(state, "research", "research_output")
+    content = (
+        f"User request: {state['user_request']}\n\n"
+        f"Planner instructions:\n{state['plan']}"
+    )
+    if state["revision_count"] > 0:
+        role_feedback = state["qa_role_feedback"].get("research", "")
+        if role_feedback:
+            content += f"\n\nQA feedback specific to your contribution:\n{role_feedback}"
+        else:
+            content += f"\n\nQA feedback to address:\n{state['qa_report']}"
     text = _llm_call(chat_model, _RESEARCH_SYSTEM, content)
-    state = _record_specialist_output(state, "research", "research_output", text, trace, "RESEARCH ANALYST")
-    trace.append(state["research_output"])
+    state["research_output"] = text
+    state["draft_output"] = text
+    trace.append(text)
     trace.append("╚══ [RESEARCH ANALYST] Done ══╝")
     return state
 
@@ -1550,10 +1145,20 @@ def _step_research(chat_model, state: WorkflowState, trace: List[str]) -> Workfl
 def _step_security(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowState:
     """Security Reviewer: analyse output for vulnerabilities and produce a secure revision."""
     trace.append("\n╔══ [SECURITY REVIEWER] Analysing for security issues... ══╗")
-    content = _build_specialist_content(state, "security", "security_output")
+    content = (
+        f"User request: {state['user_request']}\n\n"
+        f"Planner instructions:\n{state['plan']}"
+    )
+    if state["revision_count"] > 0:
+        role_feedback = state["qa_role_feedback"].get("security", "")
+        if role_feedback:
+            content += f"\n\nQA feedback specific to your contribution:\n{role_feedback}"
+        else:
+            content += f"\n\nQA feedback to address:\n{state['qa_report']}"
     text = _llm_call(chat_model, _SECURITY_SYSTEM, content)
-    state = _record_specialist_output(state, "security", "security_output", text, trace, "SECURITY REVIEWER")
-    trace.append(state["security_output"])
+    state["security_output"] = text
+    state["draft_output"] = text
+    trace.append(text)
     trace.append("╚══ [SECURITY REVIEWER] Done ══╝")
     return state
 
@@ -1561,10 +1166,20 @@ def _step_security(chat_model, state: WorkflowState, trace: List[str]) -> Workfl
 def _step_data_analyst(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowState:
     """Data Analyst: analyse data, identify patterns, and produce actionable insights."""
     trace.append("\n╔══ [DATA ANALYST] Analysing data and patterns... ══╗")
-    content = _build_specialist_content(state, "data_analyst", "data_analyst_output")
+    content = (
+        f"User request: {state['user_request']}\n\n"
+        f"Planner instructions:\n{state['plan']}"
+    )
+    if state["revision_count"] > 0:
+        role_feedback = state["qa_role_feedback"].get("data_analyst", "")
+        if role_feedback:
+            content += f"\n\nQA feedback specific to your contribution:\n{role_feedback}"
+        else:
+            content += f"\n\nQA feedback to address:\n{state['qa_report']}"
     text = _llm_call(chat_model, _DATA_ANALYST_SYSTEM, content)
-    state = _record_specialist_output(state, "data_analyst", "data_analyst_output", text, trace, "DATA ANALYST")
-    trace.append(state["data_analyst_output"])
+    state["data_analyst_output"] = text
+    state["draft_output"] = text
+    trace.append(text)
     trace.append("╚══ [DATA ANALYST] Done ══╝")
     return state
 
@@ -1572,10 +1187,20 @@ def _step_data_analyst(chat_model, state: WorkflowState, trace: List[str]) -> Wo
 def _step_mad_professor(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowState:
     """Mad Professor: propose radical, unhinged scientific theories and extreme hypotheses."""
     trace.append("\n╔══ [MAD PROFESSOR] Unleashing radical scientific theories... ══╗")
-    content = _build_specialist_content(state, "mad_professor", "mad_professor_output")
+    content = (
+        f"User request: {state['user_request']}\n\n"
+        f"Planner instructions:\n{state['plan']}"
+    )
+    if state["revision_count"] > 0:
+        role_feedback = state["qa_role_feedback"].get("mad_professor", "")
+        if role_feedback:
+            content += f"\n\nQA feedback specific to your contribution:\n{role_feedback}"
+        else:
+            content += f"\n\nQA feedback to address:\n{state['qa_report']}"
     text = _llm_call(chat_model, _MAD_PROFESSOR_SYSTEM, content)
-    state = _record_specialist_output(state, "mad_professor", "mad_professor_output", text, trace, "MAD PROFESSOR")
-    trace.append(state["mad_professor_output"])
+    state["mad_professor_output"] = text
+    state["draft_output"] = text
+    trace.append(text)
     trace.append("╚══ [MAD PROFESSOR] Done ══╝")
     return state
 
@@ -1583,10 +1208,20 @@ def _step_mad_professor(chat_model, state: WorkflowState, trace: List[str]) -> W
 def _step_accountant(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowState:
     """Accountant: ruthlessly cut costs and find the cheapest possible approach."""
     trace.append("\n╔══ [ACCOUNTANT] Auditing every cost... ══╗")
-    content = _build_specialist_content(state, "accountant", "accountant_output")
+    content = (
+        f"User request: {state['user_request']}\n\n"
+        f"Planner instructions:\n{state['plan']}"
+    )
+    if state["revision_count"] > 0:
+        role_feedback = state["qa_role_feedback"].get("accountant", "")
+        if role_feedback:
+            content += f"\n\nQA feedback specific to your contribution:\n{role_feedback}"
+        else:
+            content += f"\n\nQA feedback to address:\n{state['qa_report']}"
     text = _llm_call(chat_model, _ACCOUNTANT_SYSTEM, content)
-    state = _record_specialist_output(state, "accountant", "accountant_output", text, trace, "ACCOUNTANT")
-    trace.append(state["accountant_output"])
+    state["accountant_output"] = text
+    state["draft_output"] = text
+    trace.append(text)
     trace.append("╚══ [ACCOUNTANT] Done ══╝")
     return state
 
@@ -1594,10 +1229,20 @@ def _step_accountant(chat_model, state: WorkflowState, trace: List[str]) -> Work
 def _step_artist(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowState:
     """Artist: channel cosmic creative energy into wildly unhinged and spectacular ideas."""
     trace.append("\n╔══ [ARTIST] Channelling cosmic creative energy... ══╗")
-    content = _build_specialist_content(state, "artist", "artist_output")
+    content = (
+        f"User request: {state['user_request']}\n\n"
+        f"Planner instructions:\n{state['plan']}"
+    )
+    if state["revision_count"] > 0:
+        role_feedback = state["qa_role_feedback"].get("artist", "")
+        if role_feedback:
+            content += f"\n\nQA feedback specific to your contribution:\n{role_feedback}"
+        else:
+            content += f"\n\nQA feedback to address:\n{state['qa_report']}"
     text = _llm_call(chat_model, _ARTIST_SYSTEM, content)
-    state = _record_specialist_output(state, "artist", "artist_output", text, trace, "ARTIST")
-    trace.append(state["artist_output"])
+    state["artist_output"] = text
+    state["draft_output"] = text
+    trace.append(text)
     trace.append("╚══ [ARTIST] Done ══╝")
     return state
 
@@ -1605,10 +1250,20 @@ def _step_artist(chat_model, state: WorkflowState, trace: List[str]) -> Workflow
 def _step_lazy_slacker(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowState:
     """Lazy Slacker: find the path of least resistance and the minimum viable effort."""
     trace.append("\n╔══ [LAZY SLACKER] Doing as little as possible... ══╗")
-    content = _build_specialist_content(state, "lazy_slacker", "lazy_slacker_output")
+    content = (
+        f"User request: {state['user_request']}\n\n"
+        f"Planner instructions:\n{state['plan']}"
+    )
+    if state["revision_count"] > 0:
+        role_feedback = state["qa_role_feedback"].get("lazy_slacker", "")
+        if role_feedback:
+            content += f"\n\nQA feedback specific to your contribution:\n{role_feedback}"
+        else:
+            content += f"\n\nQA feedback to address:\n{state['qa_report']}"
     text = _llm_call(chat_model, _LAZY_SLACKER_SYSTEM, content)
-    state = _record_specialist_output(state, "lazy_slacker", "lazy_slacker_output", text, trace, "LAZY SLACKER")
-    trace.append(state["lazy_slacker_output"])
+    state["lazy_slacker_output"] = text
+    state["draft_output"] = text
+    trace.append(text)
     trace.append("╚══ [LAZY SLACKER] Done (finally) ══╝")
     return state
 
@@ -1616,12 +1271,20 @@ def _step_lazy_slacker(chat_model, state: WorkflowState, trace: List[str]) -> Wo
 def _step_black_metal_fundamentalist(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowState:
     """Black Metal Fundamentalist: deliver a nihilistic, kvlt, uncompromising perspective."""
     trace.append("\n╔══ [BLACK METAL FUNDAMENTALIST] Unleashing grim truths... ══╗")
-    content = _build_specialist_content(state, "black_metal_fundamentalist", "black_metal_fundamentalist_output")
-    text = _llm_call(chat_model, _BLACK_METAL_FUNDAMENTALIST_SYSTEM, content)
-    state = _record_specialist_output(
-        state, "black_metal_fundamentalist", "black_metal_fundamentalist_output", text, trace, "BLACK METAL FUNDAMENTALIST"
+    content = (
+        f"User request: {state['user_request']}\n\n"
+        f"Planner instructions:\n{state['plan']}"
     )
-    trace.append(state["black_metal_fundamentalist_output"])
+    if state["revision_count"] > 0:
+        role_feedback = state["qa_role_feedback"].get("black_metal_fundamentalist", "")
+        if role_feedback:
+            content += f"\n\nQA feedback specific to your contribution:\n{role_feedback}"
+        else:
+            content += f"\n\nQA feedback to address:\n{state['qa_report']}"
+    text = _llm_call(chat_model, _BLACK_METAL_FUNDAMENTALIST_SYSTEM, content)
+    state["black_metal_fundamentalist_output"] = text
+    state["draft_output"] = text
+    trace.append(text)
     trace.append("╚══ [BLACK METAL FUNDAMENTALIST] Done ══╝")
     return state
 
@@ -1629,10 +1292,20 @@ def _step_black_metal_fundamentalist(chat_model, state: WorkflowState, trace: Li
 def _step_labour_union_rep(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowState:
     """Labour Union Representative: advocate for worker rights, fair wages, and job security."""
     trace.append("\n╔══ [LABOUR UNION REPRESENTATIVE] Standing up for workers... ══╗")
-    content = _build_specialist_content(state, "labour_union_rep", "labour_union_rep_output")
+    content = (
+        f"User request: {state['user_request']}\n\n"
+        f"Planner instructions:\n{state['plan']}"
+    )
+    if state["revision_count"] > 0:
+        role_feedback = state["qa_role_feedback"].get("labour_union_rep", "")
+        if role_feedback:
+            content += f"\n\nQA feedback specific to your contribution:\n{role_feedback}"
+        else:
+            content += f"\n\nQA feedback to address:\n{state['qa_report']}"
     text = _llm_call(chat_model, _LABOUR_UNION_REP_SYSTEM, content)
-    state = _record_specialist_output(state, "labour_union_rep", "labour_union_rep_output", text, trace, "LABOUR UNION REPRESENTATIVE")
-    trace.append(state["labour_union_rep_output"])
+    state["labour_union_rep_output"] = text
+    state["draft_output"] = text
+    trace.append(text)
     trace.append("╚══ [LABOUR UNION REPRESENTATIVE] Done ══╝")
     return state
 
@@ -1640,10 +1313,20 @@ def _step_labour_union_rep(chat_model, state: WorkflowState, trace: List[str]) -
 def _step_ux_designer(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowState:
     """UX Designer: analyse user needs and produce a user-centric recommendation."""
     trace.append("\n╔══ [UX DESIGNER] Putting users first... ══╗")
-    content = _build_specialist_content(state, "ux_designer", "ux_designer_output")
+    content = (
+        f"User request: {state['user_request']}\n\n"
+        f"Planner instructions:\n{state['plan']}"
+    )
+    if state["revision_count"] > 0:
+        role_feedback = state["qa_role_feedback"].get("ux_designer", "")
+        if role_feedback:
+            content += f"\n\nQA feedback specific to your contribution:\n{role_feedback}"
+        else:
+            content += f"\n\nQA feedback to address:\n{state['qa_report']}"
     text = _llm_call(chat_model, _UX_DESIGNER_SYSTEM, content)
-    state = _record_specialist_output(state, "ux_designer", "ux_designer_output", text, trace, "UX DESIGNER")
-    trace.append(state["ux_designer_output"])
+    state["ux_designer_output"] = text
+    state["draft_output"] = text
+    trace.append(text)
     trace.append("╚══ [UX DESIGNER] Done ══╝")
     return state
 
@@ -1651,10 +1334,20 @@ def _step_ux_designer(chat_model, state: WorkflowState, trace: List[str]) -> Wor
 def _step_doris(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowState:
     """Doris: well-meaning but clueless — rambles at length without adding much value."""
     trace.append("\n╔══ [DORIS] Oh! Well, you know, I was just thinking... ══╗")
-    content = _build_specialist_content(state, "doris", "doris_output")
+    content = (
+        f"User request: {state['user_request']}\n\n"
+        f"Planner instructions:\n{state['plan']}"
+    )
+    if state["revision_count"] > 0:
+        role_feedback = state["qa_role_feedback"].get("doris", "")
+        if role_feedback:
+            content += f"\n\nQA feedback specific to your contribution:\n{role_feedback}"
+        else:
+            content += f"\n\nQA feedback to address:\n{state['qa_report']}"
     text = _llm_call(chat_model, _DORIS_SYSTEM, content)
-    state = _record_specialist_output(state, "doris", "doris_output", text, trace, "DORIS")
-    trace.append(state["doris_output"])
+    state["doris_output"] = text
+    state["draft_output"] = text
+    trace.append(text)
     trace.append("╚══ [DORIS] Anyway, where was I... Done ══╝")
     return state
 
@@ -1662,10 +1355,20 @@ def _step_doris(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowS
 def _step_chairman_of_board(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowState:
     """Chairman of the Board: provide strategic, shareholder-focused board-level direction."""
     trace.append("\n╔══ [CHAIRMAN OF THE BOARD] Calling the meeting to order... ══╗")
-    content = _build_specialist_content(state, "chairman_of_board", "chairman_of_board_output")
+    content = (
+        f"User request: {state['user_request']}\n\n"
+        f"Planner instructions:\n{state['plan']}"
+    )
+    if state["revision_count"] > 0:
+        role_feedback = state["qa_role_feedback"].get("chairman_of_board", "")
+        if role_feedback:
+            content += f"\n\nQA feedback specific to your contribution:\n{role_feedback}"
+        else:
+            content += f"\n\nQA feedback to address:\n{state['qa_report']}"
     text = _llm_call(chat_model, _CHAIRMAN_SYSTEM, content)
-    state = _record_specialist_output(state, "chairman_of_board", "chairman_of_board_output", text, trace, "CHAIRMAN OF THE BOARD")
-    trace.append(state["chairman_of_board_output"])
+    state["chairman_of_board_output"] = text
+    state["draft_output"] = text
+    trace.append(text)
     trace.append("╚══ [CHAIRMAN OF THE BOARD] Meeting adjourned ══╝")
     return state
 
@@ -1673,10 +1376,20 @@ def _step_chairman_of_board(chat_model, state: WorkflowState, trace: List[str]) 
 def _step_maga_appointee(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowState:
     """MAGA Appointee: deliver an America First, pro-deregulation, anti-globalist perspective."""
     trace.append("\n╔══ [MAGA APPOINTEE] America First! ══╗")
-    content = _build_specialist_content(state, "maga_appointee", "maga_appointee_output")
+    content = (
+        f"User request: {state['user_request']}\n\n"
+        f"Planner instructions:\n{state['plan']}"
+    )
+    if state["revision_count"] > 0:
+        role_feedback = state["qa_role_feedback"].get("maga_appointee", "")
+        if role_feedback:
+            content += f"\n\nQA feedback specific to your contribution:\n{role_feedback}"
+        else:
+            content += f"\n\nQA feedback to address:\n{state['qa_report']}"
     text = _llm_call(chat_model, _MAGA_APPOINTEE_SYSTEM, content)
-    state = _record_specialist_output(state, "maga_appointee", "maga_appointee_output", text, trace, "MAGA APPOINTEE")
-    trace.append(state["maga_appointee_output"])
+    state["maga_appointee_output"] = text
+    state["draft_output"] = text
+    trace.append(text)
     trace.append("╚══ [MAGA APPOINTEE] Done ══╝")
     return state
 
@@ -1684,98 +1397,47 @@ def _step_maga_appointee(chat_model, state: WorkflowState, trace: List[str]) -> 
 def _step_lawyer(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowState:
     """Lawyer: analyse legal implications, liabilities, and compliance requirements."""
     trace.append("\n╔══ [LAWYER] Reviewing legal implications... ══╗")
-    content = _build_specialist_content(state, "lawyer", "lawyer_output")
+    content = (
+        f"User request: {state['user_request']}\n\n"
+        f"Planner instructions:\n{state['plan']}"
+    )
+    if state["revision_count"] > 0:
+        role_feedback = state["qa_role_feedback"].get("lawyer", "")
+        if role_feedback:
+            content += f"\n\nQA feedback specific to your contribution:\n{role_feedback}"
+        else:
+            content += f"\n\nQA feedback to address:\n{state['qa_report']}"
     text = _llm_call(chat_model, _LAWYER_SYSTEM, content)
-    state = _record_specialist_output(state, "lawyer", "lawyer_output", text, trace, "LAWYER")
-    trace.append(state["lawyer_output"])
+    state["lawyer_output"] = text
+    state["draft_output"] = text
+    trace.append(text)
     trace.append("╚══ [LAWYER] Done — note: this is not formal legal advice ══╝")
     return state
 
 
-def _step_finalize(
+def _step_synthesize(
     chat_model,
     state: WorkflowState,
     trace: List[str],
     all_outputs: List[Tuple[str, str]],
 ) -> WorkflowState:
-    """Finalizer: synthesise all specialist perspectives and produce the actual deliverable.
-
-    Strategy:
-    1. Score each specialist output for requirement coverage + actionability.
-    2. Pass the best-scoring outputs (rather than all) to the LLM, so the
-       prompt is not dominated by irrelevant persona content.
-    3. Hard-guard against meta-summary output: if the LLM ignores instructions,
-       fall back to the best-scoring specialist output directly.
-    4. Never let meta-summary content overwrite best_artifact.
-    """
-    trace.append("\n╔══ [FINALIZER] Producing the deliverable from all perspectives... ══╗")
-
-    # ── Score and rank specialist outputs ────────────────────────────────────
-    qa_data = state.get("qa_data") or {}
-    requirements = (
-        (qa_data.get("missing_requirements") or [])
-        + (qa_data.get("required_fixes") or qa_data.get("recommended_fixes") or [])
-    )
-    scored: List[Tuple[float, str, str]] = []  # (score, role_key, output)
-    for r_key, r_output in all_outputs:
-        if not r_output or not r_output.strip():
-            continue
-        s = _score_candidate(r_output, requirements, state["user_request"])
-        scored.append((s, r_key, r_output))
-    scored.sort(key=lambda x: x[0], reverse=True)
-
-    # Log candidate scores
-    for s, r_key, _ in scored:
-        trace.append(f"  ℹ [FINALIZER] candidate score {s:.2f} → {AGENT_ROLES.get(r_key, r_key)}")
-
-    # Use the top-3 highest-scoring (or all if fewer) to limit LLM context
-    top_outputs = scored[:3] if len(scored) > 3 else scored
-    base_role = top_outputs[0][1] if top_outputs else (all_outputs[0][0] if all_outputs else "")
-    base_output = top_outputs[0][2] if top_outputs else (all_outputs[0][1] if all_outputs else "")
-
-    trace.append(f"  ℹ [FINALIZER] base source: {AGENT_ROLES.get(base_role, base_role)}")
-
+    """Synthesizer: summarise all specialist perspectives, find common ground, and produce a unified recommendation."""
+    trace.append("\n╔══ [SYNTHESIZER] Summarising perspectives and finding common ground... ══╗")
     perspectives = []
-    for _, r_key, r_output in top_outputs:
+    for r_key, r_output in all_outputs:
         r_label = AGENT_ROLES.get(r_key, r_key)
         perspectives.append(f"=== {r_label} ===\n{r_output}")
     combined = "\n\n".join(perspectives)
-
-    # Include the previous finalizer output if this is a revision
-    prev_final_note = ""
-    prev_final = state.get("finalized_output", "")
-    if prev_final and not _is_meta_summary(prev_final) and state["revision_count"] > 0:
-        prev_final_note = f"\nPrevious finalizer output (improve on this, do not summarise it):\n{short_text(prev_final, 800)}\n\n"
-
     content = (
         f"User request: {state['user_request']}\n\n"
-        f"{prev_final_note}"
-        f"Top specialist perspectives to synthesise into the deliverable:\n\n{combined}"
+        f"Specialist perspectives collected:\n\n{combined}"
     )
-    text = _llm_call(chat_model, _FINALIZER_SYSTEM, content)
-
-    # ── Meta-summary guard ────────────────────────────────────────────────────
-    meta_guard_triggered = False
-    if not text or not text.strip():
-        trace.append("  ⚠ [FINALIZER] returned empty output — using best specialist output.")
-        text = base_output
-        meta_guard_triggered = True
-    elif _is_meta_summary(text):
-        trace.append(
-            "  ⚠ [FINALIZER] meta-summary guard triggered (perspective-summary headers detected).\n"
-            f"    Substituting best specialist output from {AGENT_ROLES.get(base_role, base_role)}."
-        )
-        text = base_output
-        meta_guard_triggered = True
-
-    trace.append(f"  ℹ [FINALIZER] meta-summary guard: {'triggered' if meta_guard_triggered else 'not triggered'}")
-
-    state["finalized_output"] = text
+    text = _llm_call(chat_model, _SYNTHESIZER_SYSTEM, content)
+    state["synthesis_output"] = text
     state["draft_output"] = text
     trace.append(text)
-    trace.append("╚══ [FINALIZER] Done ══╝")
+    trace.append("╚══ [SYNTHESIZER] Done ══╝")
     return state
-
 
 
 # Mapping from role key → step function, used by the orchestration loop
@@ -1798,76 +1460,8 @@ _SPECIALIST_STEPS = {
     "lawyer": _step_lawyer,
 }
 
-# Mapping from role key → system prompt string (used for strict retries)
-_SPECIALIST_SYSTEM_PROMPTS: Dict[str, str] = {
-    "creative": _CREATIVE_SYSTEM,
-    "technical": _TECHNICAL_SYSTEM,
-    "research": _RESEARCH_SYSTEM,
-    "security": _SECURITY_SYSTEM,
-    "data_analyst": _DATA_ANALYST_SYSTEM,
-    "mad_professor": _MAD_PROFESSOR_SYSTEM,
-    "accountant": _ACCOUNTANT_SYSTEM,
-    "artist": _ARTIST_SYSTEM,
-    "lazy_slacker": _LAZY_SLACKER_SYSTEM,
-    "black_metal_fundamentalist": _BLACK_METAL_FUNDAMENTALIST_SYSTEM,
-    "labour_union_rep": _LABOUR_UNION_REP_SYSTEM,
-    "ux_designer": _UX_DESIGNER_SYSTEM,
-    "doris": _DORIS_SYSTEM,
-    "chairman_of_board": _CHAIRMAN_SYSTEM,
-    "maga_appointee": _MAGA_APPOINTEE_SYSTEM,
-    "lawyer": _LAWYER_SYSTEM,
-}
 
-
-def _log_revision_tracking(
-    trace: List[str],
-    role_key: str,
-    state: "WorkflowState",
-    prev_outputs: Dict[str, str],
-    is_primary: bool = False,
-) -> None:
-    """Append a revision-tracking log line for a specialist role.
-
-    Logs whether:
-    - Previous output was passed in
-    - QA feedback was passed in
-    - Role-specific feedback was passed in
-    - Output changed materially from the previous round
-    - Output is relevant to the request
-    """
-    revision = state["revision_count"]
-    if revision == 0:
-        return  # nothing to track on the first pass
-
-    output_key = f"{role_key}_output"
-    current_out = state.get(output_key, "")  # type: ignore[literal-required]
-    prev_out = prev_outputs.get(role_key, "")
-
-    had_prev = bool(prev_out and prev_out.strip())
-    had_qa = bool(state.get("qa_report"))
-    had_role_fb = bool(state["qa_role_feedback"].get(role_key))
-    changed = had_prev and current_out != prev_out
-    relevant = _is_relevant_to_request(current_out, state["user_request"])
-    qa_data = state.get("qa_data") or {}
-    requirements = (
-        (qa_data.get("missing_requirements") or [])
-        + (qa_data.get("required_fixes") or qa_data.get("recommended_fixes") or [])
-    )
-    coverage = _score_candidate(current_out, requirements, state["user_request"])
-
-    label = AGENT_ROLES.get(role_key, role_key)
-    primary_tag = " [PRIMARY]" if is_primary else ""
-    trace.append(
-        f"  📋 [{label}{primary_tag}] revision tracking — "
-        f"prev_output: {'yes' if had_prev else 'no'} | "
-        f"qa_feedback: {'yes' if had_qa else 'no'} | "
-        f"role_feedback: {'yes' if had_role_fb else 'no'} | "
-        f"output_changed: {'yes' if changed else 'no'} | "
-        f"relevant: {'yes' if relevant else 'no'} | "
-        f"coverage_score: {coverage:.2f}"
-    )
-
-
+# --- Specialist role tools ---
 # These wrap the step functions as @tool so the Planner (or any LangChain agent)
 # can invoke specialists in a standard tool-use pattern.
 
@@ -1882,9 +1476,9 @@ _EMPTY_STATE_BASE: WorkflowState = {
     "lazy_slacker_output": "", "black_metal_fundamentalist_output": "",
     "labour_union_rep_output": "", "ux_designer_output": "", "doris_output": "",
     "chairman_of_board_output": "", "maga_appointee_output": "", "lawyer_output": "",
-    "finalized_output": "",
-    "draft_output": "", "qa_report": "", "qa_data": {}, "qa_role_feedback": {}, "qa_passed": False,
-    "revision_count": 0, "best_artifact": "", "best_artifact_score": 0.0, "final_answer": "",
+    "synthesis_output": "",
+    "draft_output": "", "qa_report": "", "qa_role_feedback": {}, "qa_passed": False,
+    "revision_count": 0, "final_answer": "",
 }
 
 
@@ -2062,14 +1656,13 @@ def run_multi_role_workflow(
     Flow:
       1. Planner (if active) analyses the task and picks a primary specialist.
       2. ALL active specialists run and contribute their own perspective.
-      3. Finalizer produces the actual deliverable (not a meta-summary) from all perspectives.
-      4. QA Tester (if active) reviews the finalized output and provides structured JSON feedback
+      3. Synthesizer summarises all perspectives, finds common ground, and produces a unified recommendation.
+      4. QA Tester (if active) reviews the synthesized output and provides targeted, per-role feedback
          so each specialist knows exactly what to improve in the next iteration.
       5. Planner (if active) reviews QA result and either approves or requests a revision.
-      6. Repeat from step 2 if QA fails and retries remain — each specialist receives their
-         previous output plus targeted QA feedback so they can refine their contribution.
-      7. Best-artifact tracking ensures the best real deliverable is always returned,
-         even when the revision loop exhausts its retries.
+      6. Repeat from step 2 if QA fails and retries remain — each specialist now receives their own
+         targeted QA feedback and refines their proposition accordingly (iterative approach).
+      7. If max retries are reached, return best attempt with QA concerns.
 
     Args:
         message: The user's task or request.
@@ -2123,15 +1716,12 @@ def run_multi_role_workflow(
         "chairman_of_board_output": "",
         "maga_appointee_output": "",
         "lawyer_output": "",
-        "finalized_output": "",
+        "synthesis_output": "",
         "draft_output": "",
         "qa_report": "",
-        "qa_data": {},
         "qa_role_feedback": {},
         "qa_passed": False,
         "revision_count": 0,
-        "best_artifact": "",
-        "best_artifact_score": 0.0,
         "final_answer": "",
     }
 
@@ -2145,8 +1735,8 @@ def run_multi_role_workflow(
 
     try:
         if planner_active:
-            # Step 1: Planner creates the initial plan using only active specialist roles
-            state = _step_plan(chat_model, state, trace, active_specialist_keys)
+            # Step 1: Planner creates the initial plan
+            state = _step_plan(chat_model, state, trace)
         else:
             # No planner: auto-select first active specialist
             state["current_role"] = active_specialist_keys[0]
@@ -2155,36 +1745,20 @@ def run_multi_role_workflow(
                 f"\n[Planner disabled] Auto-routing to: {state['current_role'].upper()}"
             )
 
-        # Orchestration loop: specialists → Finalizer → QA → Planner review → revise if needed
+        # Orchestration loop: specialists → QA → Planner review → revise if needed
         while True:
             # Step 2: invoke the planner's chosen specialist first (primary lead),
             # then run every other active specialist so all voices are heard.
             primary_role = state["current_role"]
             if primary_role not in active_specialist_keys:
-                # Safe fallback: requested role not in active set — log clearly
-                fallback_role = active_specialist_keys[0]
-                trace.append(
-                    f"  ⚠ FALLBACK: Role '{AGENT_ROLES.get(primary_role, primary_role)}' is not active "
-                    f"— falling back to {AGENT_ROLES.get(fallback_role, fallback_role).upper()}"
-                )
-                primary_role = fallback_role
+                primary_role = active_specialist_keys[0]
                 state["current_role"] = primary_role
-
-            # ── Track previous outputs for revision logging ────────────────
-            prev_outputs_snapshot: Dict[str, str] = {
-                k: state.get(f"{k}_output", "")  # type: ignore[literal-required]
-                for k in active_specialist_keys
-            }
+                trace.append(f"  ⚠ Requested role not active — routing to {primary_role.upper()}")
 
             # Run the primary (planner-chosen) specialist
             primary_fn = _SPECIALIST_STEPS.get(primary_role, _step_technical)
             state = primary_fn(chat_model, state, trace)
             primary_output = state["draft_output"]
-
-            # Log revision tracking for primary specialist
-            _log_revision_tracking(
-                trace, primary_role, state, prev_outputs_snapshot, is_primary=True
-            )
 
             # Run all other active specialists and collect their perspectives
             all_outputs: List[Tuple[str, str]] = [(primary_role, primary_output)]
@@ -2193,146 +1767,59 @@ def run_multi_role_workflow(
                     continue  # already ran above
                 step_fn = _SPECIALIST_STEPS[specialist_role]
                 state = step_fn(chat_model, state, trace)
-                specialist_output = state["draft_output"]
-
-                # Log revision tracking for this specialist
-                _log_revision_tracking(
-                    trace, specialist_role, state, prev_outputs_snapshot, is_primary=False
-                )
-
-                # ── Strict retry for poor outputs (revision rounds only) ───
-                if state["revision_count"] > 0:
-                    output_key = f"{specialist_role}_output"
-                    current_output = state.get(output_key, "")  # type: ignore[literal-required]
-                    needs_retry = (
-                        _is_empty_output(current_output)
-                        or not _is_relevant_to_request(current_output, message)
-                    )
-                    if needs_retry:
-                        sys_prompt = _SPECIALIST_SYSTEM_PROMPTS.get(specialist_role)
-                        if sys_prompt:
-                            retry_text = _strict_retry_specialist(
-                                chat_model, sys_prompt, state,
-                                specialist_role, output_key, specialist_role.upper(), trace
-                            )
-                            if retry_text and retry_text.strip():
-                                state[output_key] = retry_text  # type: ignore[literal-required]
-                                state["draft_output"] = retry_text
-                                specialist_output = retry_text
-                                trace.append(
-                                    f"  ℹ [{AGENT_ROLES.get(specialist_role, specialist_role)}] "
-                                    f"strict retry: output changed "
-                                    f"({'relevant' if _is_relevant_to_request(retry_text, message) else 'still poor'})"
-                                )
-
+                # state["draft_output"] is set by every step function immediately
+                # before returning, so it is always this specialist's fresh output.
                 all_outputs.append((specialist_role, state["draft_output"]))
 
-            # Finalize all perspectives into the actual deliverable.
-            # With a single specialist, skip the finalizer and use their output directly.
+            # Synthesize all perspectives into a summary with common ground and a
+            # unified recommendation; use the synthesis as the QA/Planner draft.
             if len(all_outputs) > 1:
                 trace.append(
-                    f"\n[ALL PERSPECTIVES COLLECTED] {len(all_outputs)} specialist(s) contributed — finalizing deliverable..."
+                    f"\n[ALL PERSPECTIVES COLLECTED] {len(all_outputs)} specialist(s) contributed — synthesizing..."
                 )
-                state = _step_finalize(chat_model, state, trace, all_outputs)
+                state = _step_synthesize(chat_model, state, trace, all_outputs)
             else:
                 state["draft_output"] = primary_output
-                state["finalized_output"] = primary_output
 
-            # Update best-candidate tracking with scoring: only update if better than current best
-            current_draft = state["draft_output"]
-            if current_draft and current_draft.strip():
-                qa_data = state.get("qa_data") or {}
-                requirements = (
-                    (qa_data.get("missing_requirements") or [])
-                    + (qa_data.get("required_fixes") or qa_data.get("recommended_fixes") or [])
-                )
-                current_score = _score_candidate(current_draft, requirements, message)
-                best_score = state.get("best_artifact_score", 0.0)
-
-                if not _is_meta_summary(current_draft):
-                    if current_score >= best_score or not state.get("best_artifact"):
-                        prev_best = state.get("best_artifact", "")
-                        state["best_artifact"] = current_draft
-                        state["best_artifact_score"] = current_score
-                        updated = current_draft != prev_best
-                        trace.append(
-                            f"  ✔ Best artifact {'updated' if updated else 'confirmed'} "
-                            f"(rev {state['revision_count']}, score {current_score:.2f}): "
-                            f"{len(current_draft)} chars"
-                        )
-                    else:
-                        trace.append(
-                            f"  ℹ Current draft score {current_score:.2f} < best {best_score:.2f} "
-                            f"— keeping existing best artifact"
-                        )
-                elif not state.get("best_artifact"):
-                    # Safety net: even a meta-summary beats nothing
-                    state["best_artifact"] = current_draft
-                    state["best_artifact_score"] = 0.0
-
-            # Step 3: QA reviews the finalized draft (if enabled)
+            # Step 3: QA reviews the specialist's draft (if enabled)
             if qa_active:
                 state = _step_qa(chat_model, state, trace, all_outputs)
             else:
                 state["qa_passed"] = True
-                state["qa_data"] = {}
                 state["qa_report"] = "QA Tester is disabled — skipping quality review."
                 trace.append("\n[QA Tester disabled] Skipping quality review — auto-pass.")
 
             # Step 4: Planner reviews QA and either approves or schedules a revision
             if planner_active and qa_active:
-                prev_plan = state["plan"]
-                state = _step_planner_review(
-                    chat_model, state, trace, active_specialist_keys
-                )
+                state = _step_planner_review(chat_model, state, trace)
 
                 # Exit if the Planner approved the result
                 if state["final_answer"]:
-                    # Guard: if final_answer is a meta-summary, prefer the best artifact
-                    if _is_meta_summary(state["final_answer"]) and state.get("best_artifact"):
-                        trace.append(
-                            "  ⚠ Final answer looks like a meta-summary — substituting best artifact."
-                        )
-                        state["final_answer"] = state["best_artifact"]
                     trace.append("\n═══ WORKFLOW COMPLETE — APPROVED ═══")
                     break
 
-                # A revision was requested — log whether the plan actually changed
+                # Increment revision counter and enforce the retry limit
                 state["revision_count"] += 1
-                plan_changed = state["plan"] != prev_plan
-                trace.append(
-                    f"\n═══ REVISION {state['revision_count']} / {MAX_REVISIONS} "
-                    f"[plan {'updated' if plan_changed else 'unchanged'}] ═══"
-                )
-
                 if state["revision_count"] >= MAX_REVISIONS:
-                    # Return the best real artifact we collected, not just the last draft
-                    best = state.get("best_artifact") or state["draft_output"]
-                    state["final_answer"] = best
+                    state["final_answer"] = state["draft_output"]
                     trace.append(
                         f"\n═══ MAX REVISIONS REACHED ({MAX_REVISIONS}) ═══\n"
-                        f"Returning best artifact (score {state.get('best_artifact_score', 0.0):.2f}, "
-                        f"{len(best)} chars)."
+                        f"Returning best attempt. Outstanding QA concerns:\n{state['qa_report']}"
                     )
                     break
+
+                trace.append(f"\n═══ REVISION {state['revision_count']} / {MAX_REVISIONS} ═══")
             else:
                 # No Planner review loop — accept the draft as the final answer
-                best = state.get("best_artifact") or state["draft_output"]
-                state["final_answer"] = best
+                state["final_answer"] = state["draft_output"]
                 trace.append("\n═══ WORKFLOW COMPLETE ═══")
                 break
 
     except Exception as exc:
         trace.append(f"\n[ERROR] {exc}\n{traceback.format_exc()}")
-        # Return the best artifact collected so far, falling back to the last draft
-        state["final_answer"] = (
-            state.get("best_artifact")
-            or state.get("draft_output")
-            or f"Workflow error: {exc}"
-        )
+        state["final_answer"] = state["draft_output"] or f"Workflow error: {exc}"
 
     return state["final_answer"], "\n".join(trace)
-
 
 
 # ============================================================
@@ -2697,11 +2184,9 @@ with gr.Blocks(title="LLM + Agent tools demo", theme=gr.themes.Soft()) as demo:
         with gr.Tab("Multi-Role Workflow"):
             gr.Markdown(
                 "## Supervisor-style Multi-Role Workflow\n"
-                "**Planner** → **All Specialists** → **Finalizer** → **QA Tester** → **Planner review**\n\n"
-                "The Planner breaks the task and picks a primary specialist. All active specialists contribute, "
-                "then the Finalizer produces the actual deliverable. QA reviews it and the loop repeats up to "
-                f"**{MAX_REVISIONS}** times. Each specialist receives their previous output + targeted QA feedback "
-                "so they can improve on each revision. The best real artifact is always returned.\n\n"
+                "**Planner** → **Specialist** → **QA Tester** → **Planner review**\n\n"
+                "The Planner breaks the task, picks the right specialist, and reviews QA feedback. "
+                f"If QA fails, the loop repeats up to **{MAX_REVISIONS}** times before accepting the best attempt.\n\n"
                 "Use the checkboxes on the right to enable or disable individual agent roles."
             )
 
@@ -2772,183 +2257,6 @@ with gr.Blocks(title="LLM + Agent tools demo", theme=gr.themes.Soft()) as demo:
                 outputs=[wf_answer, wf_trace],
                 show_api=False,
             )
-
-
-# ============================================================
-# Demo / smoke-test
-# ============================================================
-
-def run_demo_lunch_menu(
-    model_id: str = DEFAULT_MODEL_ID,
-    active_roles: Optional[List[str]] = None,
-) -> Tuple[str, str]:
-    """Demo: run the multi-role workflow with 'propose a lunch menu'.
-
-    Useful for quick smoke-testing the revision loop end-to-end without the UI.
-    Returns (final_answer, workflow_trace).
-
-    Example::
-
-        answer, trace = run_demo_lunch_menu()
-        print("=== FINAL MENU ===")
-        print(answer)
-        print("=== TRACE ===")
-        print(trace)
-    """
-    task = "Propose a complete lunch menu for a casual office gathering of 10 people. Include starters, main courses, sides, desserts, and drinks. Indicate which dishes are vegetarian-friendly."
-    if active_roles is None:
-        # Use a focused subset so the demo completes in reasonable time
-        active_roles = [
-            AGENT_ROLES["planner"],
-            AGENT_ROLES["creative"],
-            AGENT_ROLES["research"],
-            AGENT_ROLES["qa_tester"],
-        ]
-    print(f"\n[DEMO] Running multi-role workflow with task: {task!r}")
-    print(f"[DEMO] Active roles: {active_roles}")
-    final_answer, trace = run_multi_role_workflow(task, model_id, active_roles)
-    print("\n[DEMO] === FINAL ANSWER ===")
-    print(final_answer or "(empty — check trace for details)")
-    print("\n[DEMO] === WORKFLOW TRACE ===")
-    print(trace)
-    return final_answer, trace
-
-
-def run_demo_three_course_menu(
-    model_id: str = DEFAULT_MODEL_ID,
-    active_roles: Optional[List[str]] = None,
-) -> Tuple[str, str]:
-    """Regression demo A: three-course menu request with structured QA revision.
-
-    Verifies:
-    - At least one revision round occurs (QA initially fails the underspecified output)
-    - Some role gets role-specific QA feedback
-    - Finalizer returns an actual structured menu, not a meta-summary
-    - Final result contains at least two options per course and practical details
-
-    Example::
-
-        answer, trace = run_demo_three_course_menu()
-        # Verify the final answer is a structured menu:
-        assert "appetizer" in answer.lower() or "starter" in answer.lower()
-        assert not any(
-            h in answer.upper()
-            for h in ("PERSPECTIVES SUMMARY", "COMMON GROUND", "TENSIONS AND TRADE-OFFS")
-        )
-    """
-    task = (
-        "Discuss best options for a three-course menu for tonight. "
-        "Include at least two options per course (appetizer, main, dessert). "
-        "For each option provide: name, key ingredients, prep/cook time, skill level, "
-        "suggested pairings, and whether it is suitable for vegetarians or vegans. "
-        "Also include total estimated time and a note on dietary variations."
-    )
-    if active_roles is None:
-        active_roles = [
-            AGENT_ROLES["planner"],
-            AGENT_ROLES["creative"],
-            AGENT_ROLES["technical"],
-            AGENT_ROLES["mad_professor"],
-            AGENT_ROLES["qa_tester"],
-        ]
-    print(f"\n[DEMO-A] Three-course menu regression demo")
-    print(f"[DEMO-A] Task: {task!r}")
-    print(f"[DEMO-A] Active roles: {active_roles}")
-    final_answer, trace = run_multi_role_workflow(task, model_id, active_roles)
-    print("\n[DEMO-A] === FINAL ANSWER ===")
-    print(final_answer or "(empty — check trace for details)")
-    print("\n[DEMO-A] === WORKFLOW TRACE ===")
-    print(trace)
-
-    # ── Assertions for regression verification ────────────────────────────
-    failures = []
-    answer_lower = final_answer.lower()
-    # Check it's not a pure meta-summary
-    if _is_meta_summary(final_answer):
-        failures.append("FAIL: Final answer looks like a meta-summary, not a menu.")
-    # Check for course structure
-    if not any(k in answer_lower for k in ("appetizer", "starter", "first course")):
-        failures.append("FAIL: No appetizer/starter section found in final answer.")
-    if not any(k in answer_lower for k in ("main", "entrée", "entree", "second course")):
-        failures.append("FAIL: No main course section found in final answer.")
-    if not any(k in answer_lower for k in ("dessert", "sweet", "third course")):
-        failures.append("FAIL: No dessert section found in final answer.")
-    # Check QA role feedback was dispatched (visible in trace)
-    if "Role-specific feedback dispatched" not in trace and "role_feedback" not in trace:
-        failures.append("WARN: No role-specific QA feedback detected in trace.")
-    # Check at least one revision occurred
-    if "REVISION 1" not in trace:
-        failures.append("WARN: No revision round detected — QA may have passed immediately.")
-
-    if failures:
-        print("\n[DEMO-A] ⚠ Regression warnings:")
-        for f in failures:
-            print(f"  {f}")
-    else:
-        print("\n[DEMO-A] ✅ All regression checks passed.")
-
-    return final_answer, trace
-
-
-def run_demo_inactive_role_fallback(
-    model_id: str = DEFAULT_MODEL_ID,
-) -> Tuple[str, str]:
-    """Regression demo B: planner asks for inactive role — clean fallback must occur.
-
-    Verifies:
-    - Planner attempts to route to 'Creative Expert' (only active specialist role is 'Technical Expert')
-    - Clean fallback is logged (no crash, no broken routing)
-    - Final result still produces a useful deliverable
-
-    Example::
-
-        answer, trace = run_demo_inactive_role_fallback()
-        assert "FALLBACK" in trace or "not active" in trace
-        assert answer and len(answer.strip()) > 20
-    """
-    task = "Write a short, engaging product description for a new AI-powered coffee maker."
-    # Deliberately enable only a small set that does NOT include Creative Expert
-    # This forces a fallback when the planner (naturally) requests Creative Expert for a writing task
-    active_roles = [
-        AGENT_ROLES["planner"],
-        AGENT_ROLES["technical"],
-        AGENT_ROLES["qa_tester"],
-    ]
-    print(f"\n[DEMO-B] Inactive role fallback regression demo")
-    print(f"[DEMO-B] Task: {task!r}")
-    print(f"[DEMO-B] Active roles: {active_roles}")
-    print(f"[DEMO-B] NOTE: 'Creative Expert' is intentionally disabled to test fallback routing.")
-    final_answer, trace = run_multi_role_workflow(task, model_id, active_roles)
-    print("\n[DEMO-B] === FINAL ANSWER ===")
-    print(final_answer or "(empty — check trace for details)")
-    print("\n[DEMO-B] === WORKFLOW TRACE ===")
-    print(trace)
-
-    # ── Assertions for regression verification ────────────────────────────
-    failures = []
-    if not final_answer or len(final_answer.strip()) < 20:
-        failures.append("FAIL: Final answer is empty or too short.")
-    # Fallback should be logged when the planner requests an inactive role
-    fallback_logged = "FALLBACK" in trace or "not active" in trace or "falling back" in trace.lower()
-    if not fallback_logged:
-        failures.append(
-            "WARN: No fallback log detected — the planner may have correctly chosen "
-            "an active role directly, or the fallback path was not triggered."
-        )
-    # Should NOT crash
-    if "[ERROR]" in trace:
-        failures.append("FAIL: Workflow error detected in trace.")
-
-    if failures:
-        print("\n[DEMO-B] ⚠ Regression warnings:")
-        for f in failures:
-            print(f"  {f}")
-    else:
-        print("\n[DEMO-B] ✅ All regression checks passed.")
-
-    return final_answer, trace
-
-
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
