@@ -499,8 +499,11 @@ TOOL_NAMES = list(ALL_TOOLS.keys())
 # Multi-role workflow — supervisor-style orchestration
 # ============================================================
 # Architecture:
-#   Planner → Specialist (Creative or Technical) → QA Tester → Planner review
-#   The Planner breaks the task, picks a specialist, and reviews QA feedback.
+#   Planner → ALL active Specialists (sequentially) → Synthesizer → QA Tester → Planner review
+#   The Planner breaks the task and picks a primary specialist.
+#   ALL active specialists then contribute their own perspective.
+#   The Synthesizer summarises every perspective, identifies common ground, and
+#   produces a single unified recommendation as the draft that goes to QA.
 #   If QA fails and retries remain, the Planner revises and loops again.
 #   If QA passes (or max retries are reached) the Planner approves a final answer.
 # ============================================================
@@ -540,7 +543,8 @@ class WorkflowState(TypedDict):
     artist_output: str
     lazy_slacker_output: str
     black_metal_fundamentalist_output: str
-    draft_output: str       # latest specialist output forwarded to QA
+    synthesis_output: str   # unified summary produced by the Synthesizer after all specialists
+    draft_output: str       # latest specialist/synthesis output forwarded to QA
     qa_report: str
     qa_passed: bool
     revision_count: int
@@ -707,6 +711,21 @@ _BLACK_METAL_FUNDAMENTALIST_SYSTEM = (
     "WHAT THE MAINSTREAM GETS WRONG:\n<brutal critique of conventional approaches to this problem>\n\n"
     "THE GRIM TRUTH:\n<the raw, unvarnished, nihilistic reality of the situation>\n\n"
     "UNDERGROUND MANIFESTO DRAFT:\n<the complete output forged in darkness and uncompromising conviction>"
+)
+
+_SYNTHESIZER_SYSTEM = (
+    "You are the Synthesizer in a multi-role AI workflow.\n"
+    "You have received perspectives on a task from multiple specialist roles.\n"
+    "Your job is to:\n"
+    "1. Briefly summarise each specialist's key point or recommendation.\n"
+    "2. Identify themes, ideas, and recommendations that appear across multiple perspectives (common ground).\n"
+    "3. Acknowledge genuine differences or tensions between perspectives.\n"
+    "4. Produce a single, balanced, unified recommendation that draws on the strongest insights from all roles.\n\n"
+    "Respond in this exact format:\n"
+    "PERSPECTIVES SUMMARY:\n<one concise bullet per role: • Role Name — key point or recommendation>\n\n"
+    "COMMON GROUND:\n<shared themes, ideas, or approaches that multiple roles agree on>\n\n"
+    "TENSIONS AND TRADE-OFFS:\n<genuine disagreements or trade-offs between perspectives — or 'None' if all perspectives align>\n\n"
+    "UNIFIED RECOMMENDATION:\n<a balanced, synthesized answer that incorporates the strongest insights from all perspectives>"
 )
 
 
@@ -1033,6 +1052,31 @@ def _step_black_metal_fundamentalist(chat_model, state: WorkflowState, trace: Li
     return state
 
 
+def _step_synthesize(
+    chat_model,
+    state: WorkflowState,
+    trace: List[str],
+    all_outputs: List[Tuple[str, str]],
+) -> WorkflowState:
+    """Synthesizer: summarise all specialist perspectives, find common ground, and produce a unified recommendation."""
+    trace.append("\n╔══ [SYNTHESIZER] Summarising perspectives and finding common ground... ══╗")
+    perspectives = []
+    for r_key, r_output in all_outputs:
+        r_label = AGENT_ROLES.get(r_key, r_key)
+        perspectives.append(f"=== {r_label} ===\n{r_output}")
+    combined = "\n\n".join(perspectives)
+    content = (
+        f"User request: {state['user_request']}\n\n"
+        f"Specialist perspectives collected:\n\n{combined}"
+    )
+    text = _llm_call(chat_model, _SYNTHESIZER_SYSTEM, content)
+    state["synthesis_output"] = text
+    state["draft_output"] = text
+    trace.append(text)
+    trace.append("╚══ [SYNTHESIZER] Done ══╝")
+    return state
+
+
 # Mapping from role key → step function, used by the orchestration loop
 _SPECIALIST_STEPS = {
     "creative": _step_creative,
@@ -1061,6 +1105,7 @@ _EMPTY_STATE_BASE: WorkflowState = {
     "research_output": "", "security_output": "", "data_analyst_output": "",
     "mad_professor_output": "", "accountant_output": "", "artist_output": "",
     "lazy_slacker_output": "", "black_metal_fundamentalist_output": "",
+    "synthesis_output": "",
     "draft_output": "", "qa_report": "", "qa_passed": False,
     "revision_count": 0, "final_answer": "",
 }
@@ -1184,12 +1229,13 @@ def run_multi_role_workflow(
     """Run the supervisor-style multi-role workflow.
 
     Flow:
-      1. Planner (if active) analyses the task and picks a specialist.
-      2. Specialist generates output; falls back to first active specialist if chosen one is disabled.
-      3. QA Tester (if active) reviews the output.
-      4. Planner (if active) reviews QA result and either approves or requests a revision.
-      5. Repeat from step 2 if QA fails and retries remain.
-      6. If max retries are reached, return best attempt with QA concerns.
+      1. Planner (if active) analyses the task and picks a primary specialist.
+      2. ALL active specialists run and contribute their own perspective.
+      3. Synthesizer summarises all perspectives, finds common ground, and produces a unified recommendation.
+      4. QA Tester (if active) reviews the synthesized output.
+      5. Planner (if active) reviews QA result and either approves or requests a revision.
+      6. Repeat from step 2 if QA fails and retries remain.
+      7. If max retries are reached, return best attempt with QA concerns.
 
     Args:
         message: The user's task or request.
@@ -1236,6 +1282,7 @@ def run_multi_role_workflow(
         "artist_output": "",
         "lazy_slacker_output": "",
         "black_metal_fundamentalist_output": "",
+        "synthesis_output": "",
         "draft_output": "",
         "qa_report": "",
         "qa_passed": False,
@@ -1285,24 +1332,17 @@ def run_multi_role_workflow(
                     continue  # already ran above
                 step_fn = _SPECIALIST_STEPS[specialist_role]
                 state = step_fn(chat_model, state, trace)
+                # state["draft_output"] is set by every step function immediately
+                # before returning, so it is always this specialist's fresh output.
                 all_outputs.append((specialist_role, state["draft_output"]))
 
-            # Combine all perspectives into a single draft for QA / Planner review
+            # Synthesize all perspectives into a summary with common ground and a
+            # unified recommendation; use the synthesis as the QA/Planner draft.
             if len(all_outputs) > 1:
-                sections = []
-                for r_key, r_output in all_outputs:
-                    r_label = AGENT_ROLES.get(r_key, r_key).upper()
-                    header = (
-                        f"─── {r_label} (PLANNER'S PRIMARY CHOICE) ───"
-                        if r_key == primary_role
-                        else f"─── {r_label} ───"
-                    )
-                    sections.append(f"{header}\n{r_output}")
-                state["draft_output"] = "\n\n".join(sections)
                 trace.append(
-                    f"\n[ALL PERSPECTIVES COLLECTED] Combined output from "
-                    f"{len(all_outputs)} specialist(s) ready for QA."
+                    f"\n[ALL PERSPECTIVES COLLECTED] {len(all_outputs)} specialist(s) contributed — synthesizing..."
                 )
+                state = _step_synthesize(chat_model, state, trace, all_outputs)
             else:
                 state["draft_output"] = primary_output
 
