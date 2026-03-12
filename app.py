@@ -2198,34 +2198,34 @@ with gr.Blocks(title="LLM + Agent tools demo", theme=gr.themes.Soft()) as demo:
                 )
 
             with gr.Row():
-                with gr.Column(scale=3):
+                with gr.Column(scale=2):
                     wf_input = gr.Textbox(
-                        label="Task / Request",
+                        label="Question",
                         placeholder=(
                             "Describe what you want the multi-role team to work on…\n"
                             "e.g. 'Write a short blog post about the benefits of open-source AI'"
                         ),
                         lines=3,
                     )
-                    wf_submit_btn = gr.Button("▶ Run Multi-Role Workflow", variant="primary")
+                    wf_submit_btn = gr.Button("Run discussion", variant="primary")
 
-                with gr.Column(scale=1):
+                with gr.Column(scale=2):
                     active_agents = gr.CheckboxGroup(
                         choices=list(AGENT_ROLES.values()),
                         value=list(AGENT_ROLES.values()),
-                        label="Active agent roles",
+                        label="Team",
                     )
 
             with gr.Row():
                 with gr.Column(scale=2):
                     wf_answer = gr.Textbox(
-                        label="✅ Final Answer (Planner approved)",
+                        label="✅ Conclusion (Planner approved)",
                         lines=14,
                         interactive=False,
                     )
                 with gr.Column(scale=3):
                     wf_trace = gr.Textbox(
-                        label="Workflow Trace — role-by-role log",
+                        label="Decision process insight",
                         lines=28,
                         interactive=False,
                     )
