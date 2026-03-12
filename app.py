@@ -558,6 +558,7 @@ class WorkflowState(TypedDict):
     synthesis_output: str   # unified summary produced by the Synthesizer after all specialists
     draft_output: str       # latest specialist/synthesis output forwarded to QA
     qa_report: str
+    qa_role_feedback: Dict[str, str]  # role key → targeted QA feedback for that specific role
     qa_passed: bool
     revision_count: int
     final_answer: str
@@ -618,10 +619,15 @@ _TECHNICAL_SYSTEM = (
 
 _QA_SYSTEM = (
     "You are the QA Tester in a multi-role AI workflow.\n"
-    "Check whether the specialist output satisfies the original request and success criteria.\n\n"
+    "Check whether the output satisfies the original request and success criteria.\n"
+    "When individual specialist contributions are provided, give targeted feedback for each role\n"
+    "so they can refine their specific propositions in the next iteration.\n\n"
     "Respond in this exact format:\n"
     "REQUIREMENTS CHECKED:\n<list each requirement and whether it was met>\n\n"
     "ISSUES FOUND:\n<defects or gaps — or 'None' if all requirements are met>\n\n"
+    "ROLE-SPECIFIC FEEDBACK:\n"
+    "<one bullet per specialist role that contributed, with targeted feedback on their contribution:\n"
+    " • Role Name: <specific feedback for that role to refine their proposition, or 'Satisfactory' if no issues>>\n\n"
     "RESULT: <PASS | FAIL>\n\n"
     "RECOMMENDED FIXES:\n<specific improvements — or 'None' if result is PASS>"
 )
@@ -936,6 +942,40 @@ def _qa_passed_check(qa_text: str) -> bool:
     return False
 
 
+def _parse_qa_role_feedback(qa_text: str) -> Dict[str, str]:
+    """Extract per-role targeted feedback from a QA report.
+
+    Looks for the ROLE-SPECIFIC FEEDBACK section produced by the QA Tester
+    and parses bullet entries of the form '• Role Name: <feedback>'.
+    Returns a dict mapping role keys (e.g. 'creative', 'technical') to the
+    feedback string targeted at that role.
+    """
+    feedback: Dict[str, str] = {}
+    if "ROLE-SPECIFIC FEEDBACK:" not in qa_text:
+        return feedback
+
+    # Extract the section between ROLE-SPECIFIC FEEDBACK: and the next header
+    section = qa_text.split("ROLE-SPECIFIC FEEDBACK:", 1)[1]
+    for header in ("RESULT:", "RECOMMENDED FIXES:"):
+        if header in section:
+            section = section.split(header, 1)[0]
+            break
+
+    # Parse bullet lines: • Role Name: <feedback text>
+    for line in section.strip().splitlines():
+        line = line.strip().lstrip("•-* ")
+        if ":" not in line:
+            continue
+        role_label, _, role_feedback = line.partition(":")
+        role_label = role_label.strip()
+        role_feedback = role_feedback.strip()
+        role_key = _ROLE_LABEL_TO_KEY.get(role_label)
+        if role_key and role_feedback:
+            feedback[role_key] = role_feedback
+
+    return feedback
+
+
 # --- Workflow step functions ---
 # Each step receives the shared state and an append-only trace list,
 # updates state in place, appends log lines, and returns updated state.
@@ -966,7 +1006,11 @@ def _step_creative(chat_model, state: WorkflowState, trace: List[str]) -> Workfl
         f"Planner instructions:\n{state['plan']}"
     )
     if state["revision_count"] > 0:
-        content += f"\n\nQA feedback to address:\n{state['qa_report']}"
+        role_feedback = state["qa_role_feedback"].get("creative", "")
+        if role_feedback:
+            content += f"\n\nQA feedback specific to your contribution:\n{role_feedback}"
+        else:
+            content += f"\n\nQA feedback to address:\n{state['qa_report']}"
     text = _llm_call(chat_model, _CREATIVE_SYSTEM, content)
     state["creative_output"] = text
     state["draft_output"] = text
@@ -983,7 +1027,11 @@ def _step_technical(chat_model, state: WorkflowState, trace: List[str]) -> Workf
         f"Planner instructions:\n{state['plan']}"
     )
     if state["revision_count"] > 0:
-        content += f"\n\nQA feedback to address:\n{state['qa_report']}"
+        role_feedback = state["qa_role_feedback"].get("technical", "")
+        if role_feedback:
+            content += f"\n\nQA feedback specific to your contribution:\n{role_feedback}"
+        else:
+            content += f"\n\nQA feedback to address:\n{state['qa_report']}"
     text = _llm_call(chat_model, _TECHNICAL_SYSTEM, content)
     state["technical_output"] = text
     state["draft_output"] = text
@@ -992,19 +1040,46 @@ def _step_technical(chat_model, state: WorkflowState, trace: List[str]) -> Workf
     return state
 
 
-def _step_qa(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowState:
-    """QA Tester: check the draft against the original request and success criteria."""
+def _step_qa(
+    chat_model,
+    state: WorkflowState,
+    trace: List[str],
+    all_outputs: Optional[List[Tuple[str, str]]] = None,
+) -> WorkflowState:
+    """QA Tester: check the draft against the original request and success criteria.
+
+    When *all_outputs* is provided (list of (role_key, output) pairs from this
+    iteration), each specialist's individual contribution is included in the
+    review prompt so the QA can supply targeted, per-role feedback.  This
+    feedback is stored in ``state['qa_role_feedback']`` and consumed by the
+    specialist step functions on the next revision pass.
+    """
     trace.append("\n╔══ [QA TESTER] Reviewing output... ══╗")
     content = (
         f"Original user request: {state['user_request']}\n\n"
         f"Planner's plan and success criteria:\n{state['plan']}\n\n"
-        f"Specialist output to review:\n{state['draft_output']}"
     )
+    if all_outputs:
+        # Include each specialist's individual output so QA can give role-specific feedback
+        content += "Individual specialist contributions:\n\n"
+        for r_key, r_output in all_outputs:
+            r_label = AGENT_ROLES.get(r_key, r_key)
+            content += f"=== {r_label} ===\n{r_output}\n\n"
+        content += f"Synthesized unified output:\n{state['draft_output']}"
+    else:
+        content += f"Specialist output to review:\n{state['draft_output']}"
     text = _llm_call(chat_model, _QA_SYSTEM, content)
     state["qa_report"] = text
+    state["qa_role_feedback"] = _parse_qa_role_feedback(text)
     state["qa_passed"] = _qa_passed_check(text)
     result_label = "✅ PASS" if state["qa_passed"] else "❌ FAIL"
     trace.append(text)
+    if state["qa_role_feedback"]:
+        feedback_summary = ", ".join(
+            f"{AGENT_ROLES.get(k, k)}: {v[:60]}{'…' if len(v) > 60 else ''}"
+            for k, v in state["qa_role_feedback"].items()
+        )
+        trace.append(f"  ℹ Role-specific feedback dispatched → {feedback_summary}")
     trace.append(f"╚══ [QA TESTER] Result: {result_label} ══╝")
     return state
 
@@ -1054,7 +1129,11 @@ def _step_research(chat_model, state: WorkflowState, trace: List[str]) -> Workfl
         f"Planner instructions:\n{state['plan']}"
     )
     if state["revision_count"] > 0:
-        content += f"\n\nQA feedback to address:\n{state['qa_report']}"
+        role_feedback = state["qa_role_feedback"].get("research", "")
+        if role_feedback:
+            content += f"\n\nQA feedback specific to your contribution:\n{role_feedback}"
+        else:
+            content += f"\n\nQA feedback to address:\n{state['qa_report']}"
     text = _llm_call(chat_model, _RESEARCH_SYSTEM, content)
     state["research_output"] = text
     state["draft_output"] = text
@@ -1071,7 +1150,11 @@ def _step_security(chat_model, state: WorkflowState, trace: List[str]) -> Workfl
         f"Planner instructions:\n{state['plan']}"
     )
     if state["revision_count"] > 0:
-        content += f"\n\nQA feedback to address:\n{state['qa_report']}"
+        role_feedback = state["qa_role_feedback"].get("security", "")
+        if role_feedback:
+            content += f"\n\nQA feedback specific to your contribution:\n{role_feedback}"
+        else:
+            content += f"\n\nQA feedback to address:\n{state['qa_report']}"
     text = _llm_call(chat_model, _SECURITY_SYSTEM, content)
     state["security_output"] = text
     state["draft_output"] = text
@@ -1088,7 +1171,11 @@ def _step_data_analyst(chat_model, state: WorkflowState, trace: List[str]) -> Wo
         f"Planner instructions:\n{state['plan']}"
     )
     if state["revision_count"] > 0:
-        content += f"\n\nQA feedback to address:\n{state['qa_report']}"
+        role_feedback = state["qa_role_feedback"].get("data_analyst", "")
+        if role_feedback:
+            content += f"\n\nQA feedback specific to your contribution:\n{role_feedback}"
+        else:
+            content += f"\n\nQA feedback to address:\n{state['qa_report']}"
     text = _llm_call(chat_model, _DATA_ANALYST_SYSTEM, content)
     state["data_analyst_output"] = text
     state["draft_output"] = text
@@ -1105,7 +1192,11 @@ def _step_mad_professor(chat_model, state: WorkflowState, trace: List[str]) -> W
         f"Planner instructions:\n{state['plan']}"
     )
     if state["revision_count"] > 0:
-        content += f"\n\nQA feedback to address:\n{state['qa_report']}"
+        role_feedback = state["qa_role_feedback"].get("mad_professor", "")
+        if role_feedback:
+            content += f"\n\nQA feedback specific to your contribution:\n{role_feedback}"
+        else:
+            content += f"\n\nQA feedback to address:\n{state['qa_report']}"
     text = _llm_call(chat_model, _MAD_PROFESSOR_SYSTEM, content)
     state["mad_professor_output"] = text
     state["draft_output"] = text
@@ -1122,7 +1213,11 @@ def _step_accountant(chat_model, state: WorkflowState, trace: List[str]) -> Work
         f"Planner instructions:\n{state['plan']}"
     )
     if state["revision_count"] > 0:
-        content += f"\n\nQA feedback to address:\n{state['qa_report']}"
+        role_feedback = state["qa_role_feedback"].get("accountant", "")
+        if role_feedback:
+            content += f"\n\nQA feedback specific to your contribution:\n{role_feedback}"
+        else:
+            content += f"\n\nQA feedback to address:\n{state['qa_report']}"
     text = _llm_call(chat_model, _ACCOUNTANT_SYSTEM, content)
     state["accountant_output"] = text
     state["draft_output"] = text
@@ -1139,7 +1234,11 @@ def _step_artist(chat_model, state: WorkflowState, trace: List[str]) -> Workflow
         f"Planner instructions:\n{state['plan']}"
     )
     if state["revision_count"] > 0:
-        content += f"\n\nQA feedback to address:\n{state['qa_report']}"
+        role_feedback = state["qa_role_feedback"].get("artist", "")
+        if role_feedback:
+            content += f"\n\nQA feedback specific to your contribution:\n{role_feedback}"
+        else:
+            content += f"\n\nQA feedback to address:\n{state['qa_report']}"
     text = _llm_call(chat_model, _ARTIST_SYSTEM, content)
     state["artist_output"] = text
     state["draft_output"] = text
@@ -1156,7 +1255,11 @@ def _step_lazy_slacker(chat_model, state: WorkflowState, trace: List[str]) -> Wo
         f"Planner instructions:\n{state['plan']}"
     )
     if state["revision_count"] > 0:
-        content += f"\n\nQA feedback to address:\n{state['qa_report']}"
+        role_feedback = state["qa_role_feedback"].get("lazy_slacker", "")
+        if role_feedback:
+            content += f"\n\nQA feedback specific to your contribution:\n{role_feedback}"
+        else:
+            content += f"\n\nQA feedback to address:\n{state['qa_report']}"
     text = _llm_call(chat_model, _LAZY_SLACKER_SYSTEM, content)
     state["lazy_slacker_output"] = text
     state["draft_output"] = text
@@ -1173,7 +1276,11 @@ def _step_black_metal_fundamentalist(chat_model, state: WorkflowState, trace: Li
         f"Planner instructions:\n{state['plan']}"
     )
     if state["revision_count"] > 0:
-        content += f"\n\nQA feedback to address:\n{state['qa_report']}"
+        role_feedback = state["qa_role_feedback"].get("black_metal_fundamentalist", "")
+        if role_feedback:
+            content += f"\n\nQA feedback specific to your contribution:\n{role_feedback}"
+        else:
+            content += f"\n\nQA feedback to address:\n{state['qa_report']}"
     text = _llm_call(chat_model, _BLACK_METAL_FUNDAMENTALIST_SYSTEM, content)
     state["black_metal_fundamentalist_output"] = text
     state["draft_output"] = text
@@ -1190,7 +1297,11 @@ def _step_labour_union_rep(chat_model, state: WorkflowState, trace: List[str]) -
         f"Planner instructions:\n{state['plan']}"
     )
     if state["revision_count"] > 0:
-        content += f"\n\nQA feedback to address:\n{state['qa_report']}"
+        role_feedback = state["qa_role_feedback"].get("labour_union_rep", "")
+        if role_feedback:
+            content += f"\n\nQA feedback specific to your contribution:\n{role_feedback}"
+        else:
+            content += f"\n\nQA feedback to address:\n{state['qa_report']}"
     text = _llm_call(chat_model, _LABOUR_UNION_REP_SYSTEM, content)
     state["labour_union_rep_output"] = text
     state["draft_output"] = text
@@ -1207,7 +1318,11 @@ def _step_ux_designer(chat_model, state: WorkflowState, trace: List[str]) -> Wor
         f"Planner instructions:\n{state['plan']}"
     )
     if state["revision_count"] > 0:
-        content += f"\n\nQA feedback to address:\n{state['qa_report']}"
+        role_feedback = state["qa_role_feedback"].get("ux_designer", "")
+        if role_feedback:
+            content += f"\n\nQA feedback specific to your contribution:\n{role_feedback}"
+        else:
+            content += f"\n\nQA feedback to address:\n{state['qa_report']}"
     text = _llm_call(chat_model, _UX_DESIGNER_SYSTEM, content)
     state["ux_designer_output"] = text
     state["draft_output"] = text
@@ -1224,7 +1339,11 @@ def _step_doris(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowS
         f"Planner instructions:\n{state['plan']}"
     )
     if state["revision_count"] > 0:
-        content += f"\n\nQA feedback to address:\n{state['qa_report']}"
+        role_feedback = state["qa_role_feedback"].get("doris", "")
+        if role_feedback:
+            content += f"\n\nQA feedback specific to your contribution:\n{role_feedback}"
+        else:
+            content += f"\n\nQA feedback to address:\n{state['qa_report']}"
     text = _llm_call(chat_model, _DORIS_SYSTEM, content)
     state["doris_output"] = text
     state["draft_output"] = text
@@ -1241,7 +1360,11 @@ def _step_chairman_of_board(chat_model, state: WorkflowState, trace: List[str]) 
         f"Planner instructions:\n{state['plan']}"
     )
     if state["revision_count"] > 0:
-        content += f"\n\nQA feedback to address:\n{state['qa_report']}"
+        role_feedback = state["qa_role_feedback"].get("chairman_of_board", "")
+        if role_feedback:
+            content += f"\n\nQA feedback specific to your contribution:\n{role_feedback}"
+        else:
+            content += f"\n\nQA feedback to address:\n{state['qa_report']}"
     text = _llm_call(chat_model, _CHAIRMAN_SYSTEM, content)
     state["chairman_of_board_output"] = text
     state["draft_output"] = text
@@ -1258,7 +1381,11 @@ def _step_maga_appointee(chat_model, state: WorkflowState, trace: List[str]) -> 
         f"Planner instructions:\n{state['plan']}"
     )
     if state["revision_count"] > 0:
-        content += f"\n\nQA feedback to address:\n{state['qa_report']}"
+        role_feedback = state["qa_role_feedback"].get("maga_appointee", "")
+        if role_feedback:
+            content += f"\n\nQA feedback specific to your contribution:\n{role_feedback}"
+        else:
+            content += f"\n\nQA feedback to address:\n{state['qa_report']}"
     text = _llm_call(chat_model, _MAGA_APPOINTEE_SYSTEM, content)
     state["maga_appointee_output"] = text
     state["draft_output"] = text
@@ -1275,7 +1402,11 @@ def _step_lawyer(chat_model, state: WorkflowState, trace: List[str]) -> Workflow
         f"Planner instructions:\n{state['plan']}"
     )
     if state["revision_count"] > 0:
-        content += f"\n\nQA feedback to address:\n{state['qa_report']}"
+        role_feedback = state["qa_role_feedback"].get("lawyer", "")
+        if role_feedback:
+            content += f"\n\nQA feedback specific to your contribution:\n{role_feedback}"
+        else:
+            content += f"\n\nQA feedback to address:\n{state['qa_report']}"
     text = _llm_call(chat_model, _LAWYER_SYSTEM, content)
     state["lawyer_output"] = text
     state["draft_output"] = text
@@ -1346,7 +1477,7 @@ _EMPTY_STATE_BASE: WorkflowState = {
     "labour_union_rep_output": "", "ux_designer_output": "", "doris_output": "",
     "chairman_of_board_output": "", "maga_appointee_output": "", "lawyer_output": "",
     "synthesis_output": "",
-    "draft_output": "", "qa_report": "", "qa_passed": False,
+    "draft_output": "", "qa_report": "", "qa_role_feedback": {}, "qa_passed": False,
     "revision_count": 0, "final_answer": "",
 }
 
@@ -1526,9 +1657,11 @@ def run_multi_role_workflow(
       1. Planner (if active) analyses the task and picks a primary specialist.
       2. ALL active specialists run and contribute their own perspective.
       3. Synthesizer summarises all perspectives, finds common ground, and produces a unified recommendation.
-      4. QA Tester (if active) reviews the synthesized output.
+      4. QA Tester (if active) reviews the synthesized output and provides targeted, per-role feedback
+         so each specialist knows exactly what to improve in the next iteration.
       5. Planner (if active) reviews QA result and either approves or requests a revision.
-      6. Repeat from step 2 if QA fails and retries remain.
+      6. Repeat from step 2 if QA fails and retries remain — each specialist now receives their own
+         targeted QA feedback and refines their proposition accordingly (iterative approach).
       7. If max retries are reached, return best attempt with QA concerns.
 
     Args:
@@ -1586,6 +1719,7 @@ def run_multi_role_workflow(
         "synthesis_output": "",
         "draft_output": "",
         "qa_report": "",
+        "qa_role_feedback": {},
         "qa_passed": False,
         "revision_count": 0,
         "final_answer": "",
@@ -1649,7 +1783,7 @@ def run_multi_role_workflow(
 
             # Step 3: QA reviews the specialist's draft (if enabled)
             if qa_active:
-                state = _step_qa(chat_model, state, trace)
+                state = _step_qa(chat_model, state, trace, all_outputs)
             else:
                 state["qa_passed"] = True
                 state["qa_report"] = "QA Tester is disabled — skipping quality review."
