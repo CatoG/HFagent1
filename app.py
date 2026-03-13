@@ -2062,8 +2062,86 @@ with gr.Blocks(title="LLM + Agent tools demo", theme=gr.themes.Soft()) as demo:
 
     with gr.Tabs():
 
-        # ── Tab 1: existing single-agent demo (unchanged) ──────────────────
-        with gr.Tab("Agent Demo"):
+        # ── Tab 1: Agent discussion demo ────────────────────────────────────
+        with gr.Tab("Agent discussion demo"):
+            gr.Markdown(
+                "## Supervisor-style Multi-Role Workflow\n"
+                "**Planner** \u2192 **Specialist** \u2192 **QA Tester** \u2192 **Planner review**\n\n"
+                "The Planner breaks the task, picks the right specialist, and reviews QA feedback. "
+                f"If QA fails, the loop repeats up to **{MAX_REVISIONS}** times before accepting the best attempt.\n\n"
+                "Use the checkboxes on the right to enable or disable individual agent roles."
+            )
+
+            with gr.Row():
+                wf_model_dropdown = gr.Dropdown(
+                    choices=MODEL_OPTIONS,
+                    value=DEFAULT_MODEL_ID,
+                    label="Model",
+                )
+
+            with gr.Row():
+                with gr.Column(scale=2):
+                    wf_input = gr.Textbox(
+                        label="Question",
+                        placeholder=(
+                            "Describe what you want the multi-role team to work on\u2026\n"
+                            "e.g. 'Write a short blog post about the benefits of open-source AI'"
+                        ),
+                        lines=3,
+                    )
+                    wf_submit_btn = gr.Button("Run discussion", variant="primary")
+
+                with gr.Column(scale=2):
+                    active_agents = gr.CheckboxGroup(
+                        choices=list(AGENT_ROLES.values()),
+                        value=list(AGENT_ROLES.values()),
+                        label="Team",
+                    )
+
+            with gr.Row():
+                with gr.Column(scale=2):
+                    wf_answer = gr.Textbox(
+                        label="\u2705 Conclusion (Planner approved)",
+                        lines=14,
+                        interactive=False,
+                    )
+                with gr.Column(scale=3):
+                    wf_trace = gr.Textbox(
+                        label="Decision process insight",
+                        lines=28,
+                        interactive=False,
+                    )
+
+            def _run_workflow_ui(
+                message: str, model_id: str, role_labels: List[str]
+            ) -> Tuple[str, str]:
+                """Gradio handler: validate input, run the workflow, return outputs."""
+                if not message or not message.strip():
+                    return "No input provided.", ""
+                try:
+                    final_answer, trace = run_multi_role_workflow(
+                        message.strip(), model_id, role_labels
+                    )
+                    return final_answer, trace
+                except Exception as exc:
+                    return f"Workflow error: {exc}", traceback.format_exc()
+
+            wf_submit_btn.click(
+                fn=_run_workflow_ui,
+                inputs=[wf_input, wf_model_dropdown, active_agents],
+                outputs=[wf_answer, wf_trace],
+                show_api=False,
+            )
+
+            wf_input.submit(
+                fn=_run_workflow_ui,
+                inputs=[wf_input, wf_model_dropdown, active_agents],
+                outputs=[wf_answer, wf_trace],
+                show_api=False,
+            )
+
+        # ── Tab 2: Use of tools demo ──────────────────────────────────────────
+        with gr.Tab("Use of tools demo"):
             with gr.Row():
                 model_dropdown = gr.Dropdown(
                     choices=MODEL_OPTIONS,
@@ -2177,84 +2255,6 @@ with gr.Blocks(title="LLM + Agent tools demo", theme=gr.themes.Soft()) as demo:
                 fn=lambda model_id: ([], "", "", None, model_status_text(model_id), ""),
                 inputs=[model_dropdown],
                 outputs=[chatbot, tool_trace, user_input, chart_output, model_status, debug_output],
-                show_api=False,
-            )
-
-        # ── Tab 2: multi-role workflow demo ────────────────────────────────
-        with gr.Tab("Multi-Role Workflow"):
-            gr.Markdown(
-                "## Supervisor-style Multi-Role Workflow\n"
-                "**Planner** → **Specialist** → **QA Tester** → **Planner review**\n\n"
-                "The Planner breaks the task, picks the right specialist, and reviews QA feedback. "
-                f"If QA fails, the loop repeats up to **{MAX_REVISIONS}** times before accepting the best attempt.\n\n"
-                "Use the checkboxes on the right to enable or disable individual agent roles."
-            )
-
-            with gr.Row():
-                wf_model_dropdown = gr.Dropdown(
-                    choices=MODEL_OPTIONS,
-                    value=DEFAULT_MODEL_ID,
-                    label="Model",
-                )
-
-            with gr.Row():
-                with gr.Column(scale=2):
-                    wf_input = gr.Textbox(
-                        label="Question",
-                        placeholder=(
-                            "Describe what you want the multi-role team to work on…\n"
-                            "e.g. 'Write a short blog post about the benefits of open-source AI'"
-                        ),
-                        lines=3,
-                    )
-                    wf_submit_btn = gr.Button("Run discussion", variant="primary")
-
-                with gr.Column(scale=2):
-                    active_agents = gr.CheckboxGroup(
-                        choices=list(AGENT_ROLES.values()),
-                        value=list(AGENT_ROLES.values()),
-                        label="Team",
-                    )
-
-            with gr.Row():
-                with gr.Column(scale=2):
-                    wf_answer = gr.Textbox(
-                        label="✅ Conclusion (Planner approved)",
-                        lines=14,
-                        interactive=False,
-                    )
-                with gr.Column(scale=3):
-                    wf_trace = gr.Textbox(
-                        label="Decision process insight",
-                        lines=28,
-                        interactive=False,
-                    )
-
-            def _run_workflow_ui(
-                message: str, model_id: str, role_labels: List[str]
-            ) -> Tuple[str, str]:
-                """Gradio handler: validate input, run the workflow, return outputs."""
-                if not message or not message.strip():
-                    return "No input provided.", ""
-                try:
-                    final_answer, trace = run_multi_role_workflow(
-                        message.strip(), model_id, role_labels
-                    )
-                    return final_answer, trace
-                except Exception as exc:
-                    return f"Workflow error: {exc}", traceback.format_exc()
-
-            wf_submit_btn.click(
-                fn=_run_workflow_ui,
-                inputs=[wf_input, wf_model_dropdown, active_agents],
-                outputs=[wf_answer, wf_trace],
-                show_api=False,
-            )
-
-            wf_input.submit(
-                fn=_run_workflow_ui,
-                inputs=[wf_input, wf_model_dropdown, active_agents],
-                outputs=[wf_answer, wf_trace],
                 show_api=False,
             )
 
