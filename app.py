@@ -20,6 +20,8 @@ from workflow_helpers import (
     select_relevant_roles, identify_revision_targets,
     compress_final_answer, strip_internal_noise,
     get_synthesizer_format_instruction, get_qa_format_instruction,
+    validate_output_format, format_violations_instruction,
+    parse_task_assumptions, format_assumptions_for_prompt,
     ROLE_RELEVANCE,
 )
 from evidence import (
@@ -601,6 +603,8 @@ class WorkflowState(TypedDict):
     output_format: str      # detected output format (single_choice, short_answer, etc.)
     brevity_requirement: str  # minimal, short, normal, verbose
     qa_structured: Optional[dict]  # serialised QAResult for structured QA
+    task_assumptions: Dict[str, str]  # shared assumptions all specialists must use
+    revision_instruction: str  # latest revision instruction from planner
 
 
 # --- Role system prompts ---
@@ -628,6 +632,8 @@ _PLANNER_SYSTEM = (
     "- QA results are BINDING — if QA says FAIL, you MUST revise, never approve.\n\n"
     "Respond in this exact format:\n"
     "TASK BREAKDOWN:\n<subtask list>\n\n"
+    "TASK ASSUMPTIONS:\n<shared assumptions all specialists must use, e.g. cost model, "
+    "coverage rate, units, scope, time frame — one per line as 'key: value'>\n\n"
     "ROLE TO CALL: <specialist name>\n\n"
     "SUCCESS CRITERIA:\n<what a correct, complete answer looks like>\n\n"
     "GUIDANCE FOR SPECIALIST:\n<any constraints or focus areas>"
@@ -1655,6 +1661,7 @@ _EMPTY_STATE_BASE: WorkflowState = {
     "draft_output": "", "qa_report": "", "qa_role_feedback": {}, "qa_passed": False,
     "revision_count": 0, "final_answer": "",
     "output_format": "other", "brevity_requirement": "normal", "qa_structured": None,
+    "task_assumptions": {}, "revision_instruction": "",
 }
 
 
@@ -1921,6 +1928,8 @@ def run_multi_role_workflow(
         "output_format": output_format,
         "brevity_requirement": brevity,
         "qa_structured": None,
+        "task_assumptions": {},
+        "revision_instruction": "",
     }
 
     trace: List[str] = [
@@ -1958,6 +1967,14 @@ def run_multi_role_workflow(
     try:
         if planner_active:
             state = _step_plan(chat_model, state, trace)
+
+            # Parse shared task assumptions from planner output
+            assumptions = parse_task_assumptions(state["plan"])
+            if assumptions:
+                state["task_assumptions"] = assumptions
+                planner_state.task_assumptions = assumptions
+                trace.append(f"[ASSUMPTIONS] {len(assumptions)} shared assumption(s) set: "
+                             + ", ".join(f"{k}={v}" for k, v in assumptions.items()))
         else:
             state["current_role"] = active_specialist_keys[0]
             state["plan"] = message
@@ -1993,39 +2010,62 @@ def run_multi_role_workflow(
             + ", ".join(AGENT_ROLES.get(k, k) for k in selected_roles)
         )
 
-        # Main orchestration loop
-        while True:
-            # Step 4: Run selected specialists
-            if primary_role not in selected_roles:
-                primary_role = selected_roles[0]
-                state["current_role"] = primary_role
+        # Step 4: Run ALL selected specialists (initial run only)
+        if primary_role not in selected_roles:
+            primary_role = selected_roles[0]
+            state["current_role"] = primary_role
 
-            # Run primary specialist (research gets evidence injected)
-            primary_fn = _SPECIALIST_STEPS.get(primary_role, _step_technical)
-            if primary_role == "research" and evidence:
-                state = _step_research(chat_model, state, trace, evidence=evidence)
-            else:
-                state = primary_fn(chat_model, state, trace)
-            primary_output = state["draft_output"]
-            planner_state.specialist_outputs[primary_role] = primary_output[:500]
+        # Build assumptions context for specialist prompts
+        assumptions_ctx = format_assumptions_for_prompt(state.get("task_assumptions", {}))
 
-            all_outputs: List[Tuple[str, str]] = [(primary_role, primary_output)]
-            for specialist_role in selected_roles:
-                if specialist_role == primary_role:
-                    continue
-                if specialist_role == "research" and evidence:
-                    state = _step_research(chat_model, state, trace, evidence=evidence)
-                else:
-                    step_fn = _SPECIALIST_STEPS[specialist_role]
-                    state = step_fn(chat_model, state, trace)
-                output = state["draft_output"]
-                all_outputs.append((specialist_role, output))
-                planner_state.specialist_outputs[specialist_role] = output[:500]
+        def _run_specialist(role_key):
+            """Run a single specialist, injecting evidence and assumptions as needed."""
+            if role_key == "research" and evidence:
+                return _step_research(chat_model, state, trace, evidence=evidence)
+            step_fn = _SPECIALIST_STEPS.get(role_key, _step_technical)
+            # Inject shared assumptions into plan context for specialist
+            if assumptions_ctx and assumptions_ctx not in state["plan"]:
+                state["plan"] = state["plan"] + "\n\n" + assumptions_ctx
+            return step_fn(chat_model, state, trace)
 
-            # Step 5: Synthesize — format-aware, evidence-grounded
+        # Run primary specialist
+        state = _run_specialist(primary_role)
+        primary_output = state["draft_output"]
+        planner_state.specialist_outputs[primary_role] = primary_output[:500]
+
+        all_outputs: List[Tuple[str, str]] = [(primary_role, primary_output)]
+        for specialist_role in selected_roles:
+            if specialist_role == primary_role:
+                continue
+            state = _run_specialist(specialist_role)
+            output = state["draft_output"]
+            all_outputs.append((specialist_role, output))
+            planner_state.specialist_outputs[specialist_role] = output[:500]
+
+        # Step 5: Synthesize — format-aware, evidence-grounded
+        state = _step_synthesize(chat_model, state, trace, all_outputs,
+                                 evidence=evidence)
+
+        # Step 5b: Pre-QA format validation — catch structural violations early
+        fmt_violations = validate_output_format(
+            state["draft_output"], output_format, brevity
+        )
+        if fmt_violations:
+            trace.append(
+                "\n[FORMAT VALIDATION] Violations detected before QA:\n"
+                + "\n".join(f"  - {v}" for v in fmt_violations)
+            )
+            # Re-synthesize with explicit violation feedback
+            violation_instr = format_violations_instruction(fmt_violations)
+            state["plan"] = state["plan"] + "\n\n" + violation_instr
             state = _step_synthesize(chat_model, state, trace, all_outputs,
                                      evidence=evidence)
+            planner_state.record_event("format_rewrite", "; ".join(fmt_violations))
+            trace.append("[FORMAT VALIDATION] Re-synthesized to fix format violations.")
 
+        # === QA-REVISION LOOP ===
+        # From here, only QA + planner review + targeted revision (no full specialist rerun)
+        while True:
             # Step 6: QA validation (with evidence context)
             if qa_active:
                 state = _step_qa(chat_model, state, trace, all_outputs,
@@ -2056,7 +2096,18 @@ def run_multi_role_workflow(
                     trace.append("\n═══ WORKFLOW COMPLETE — APPROVED ═══")
                     break
 
-                # QA failed and planner was forced to revise
+                # QA failed and planner was forced to revise —
+                # store revision instruction reliably
+                revision_instr = ""
+                if "REVISED INSTRUCTIONS:" in state.get("plan", ""):
+                    revision_instr = state["plan"]
+                elif qa_result.correction_instruction:
+                    revision_instr = qa_result.correction_instruction
+                state["revision_instruction"] = revision_instr
+                planner_state.revision_instruction = revision_instr
+                planner_state.record_event("revision_instruction_stored",
+                                           revision_instr[:200] if revision_instr else "MISSING")
+
                 state["revision_count"] += 1
                 planner_state.revision_count = state["revision_count"]
 
@@ -2079,7 +2130,6 @@ def run_multi_role_workflow(
                     planner_state.record_event("escalation", escalation)
 
                     if escalation == "suppress_role":
-                        # Suppress roles that keep producing unsupported content
                         suppress = planner_state.get_roles_to_suppress()
                         for role_label in suppress:
                             role_key = _ROLE_LABEL_TO_KEY.get(role_label)
@@ -2090,17 +2140,15 @@ def run_multi_role_workflow(
                             selected_roles = [primary_role]
 
                     elif escalation == "rewrite_from_state":
-                        # Synthesizer should rewrite from state, not reuse bloated draft
                         trace.append("  ⚠ Synthesizer will rewrite from state instead of reusing draft")
-                        state["draft_output"] = ""  # Force synthesizer to rebuild
+                        state["draft_output"] = ""
 
                     elif escalation == "narrow_scope":
-                        # Reduce to a single specialist
                         if len(selected_roles) > 1:
                             selected_roles = [selected_roles[0]]
                             trace.append(f"  ⚠ Narrowed to single specialist: {selected_roles[0]}")
 
-                # Step 9: TARGETED REVISIONS — only rerun failing role(s)
+                # Step 9: TARGETED REVISIONS — only rerun the failing role(s)
                 revision_targets = identify_revision_targets(qa_result, _ROLE_LABEL_TO_KEY)
                 trace.append(
                     f"\n═══ REVISION {state['revision_count']} / {MAX_REVISIONS} ═══\n"
@@ -2108,45 +2156,46 @@ def run_multi_role_workflow(
                 )
                 planner_state.record_event("revision", f"targets={revision_targets}")
 
-                # Determine what to rerun
+                # Only rerun the targeted specialists — NOT all specialists
                 rerun_specialists = [
                     t for t in revision_targets
                     if t in _SPECIALIST_STEPS and t in selected_roles
                 ]
-                rerun_synthesizer = "synthesizer" in revision_targets or rerun_specialists
+                rerun_synthesizer = "synthesizer" in revision_targets or bool(rerun_specialists)
 
                 if rerun_specialists:
-                    # Only rerun the targeted specialists
                     new_outputs = []
                     for rk in rerun_specialists:
-                        if rk == "research" and evidence:
-                            state = _step_research(chat_model, state, trace, evidence=evidence)
-                        else:
-                            step_fn = _SPECIALIST_STEPS[rk]
-                            state = step_fn(chat_model, state, trace)
+                        state = _run_specialist(rk)
                         new_outputs.append((rk, state["draft_output"]))
                         planner_state.specialist_outputs[rk] = state["draft_output"][:500]
 
-                    # Merge with previous outputs (replace updated roles)
+                    # Merge: replace updated roles, keep others unchanged
                     updated_keys = {rk for rk, _ in new_outputs}
-                    merged_outputs = [
+                    all_outputs = [
                         (rk, out) for rk, out in all_outputs if rk not in updated_keys
                     ] + new_outputs
-                    all_outputs = merged_outputs
 
                 if rerun_synthesizer or rerun_specialists:
                     state = _step_synthesize(chat_model, state, trace, all_outputs,
                                              evidence=evidence)
 
-                # Update selected_roles based on planner's new routing
-                primary_role = state["current_role"]
-                if primary_role in selected_roles:
-                    pass  # keep existing selection
-                elif primary_role in active_specialist_keys:
-                    selected_roles = [primary_role] + [r for r in selected_roles if r != primary_role]
-                    selected_roles = selected_roles[:config.max_specialists_per_task]
+                    # Post-revision format validation
+                    fmt_violations = validate_output_format(
+                        state["draft_output"], output_format, brevity
+                    )
+                    if fmt_violations:
+                        trace.append(
+                            "\n[FORMAT VALIDATION] Post-revision violations:\n"
+                            + "\n".join(f"  - {v}" for v in fmt_violations)
+                        )
+                        violation_instr = format_violations_instruction(fmt_violations)
+                        state["plan"] = state["plan"] + "\n\n" + violation_instr
+                        state = _step_synthesize(chat_model, state, trace, all_outputs,
+                                                 evidence=evidence)
 
-                continue  # Loop back to QA
+                # Loop back to QA — NOT back to specialists
+                continue
 
             else:
                 # No Planner review loop — accept the draft

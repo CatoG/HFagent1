@@ -35,6 +35,10 @@ from workflow_helpers import (
     FailureRecord,
     get_synthesizer_format_instruction,
     get_qa_format_instruction,
+    validate_output_format,
+    format_violations_instruction,
+    parse_task_assumptions,
+    format_assumptions_for_prompt,
 )
 from evidence import (
     EvidenceItem,
@@ -1021,6 +1025,198 @@ class TestPlannerStateExtended(unittest.TestCase):
 
 # ============================================================
 # Test: Scenario - Role Selection with Task Categories
+# ============================================================
+
+# ============================================================
+# Test: Output Format Validation
+# ============================================================
+
+class TestFormatValidation(unittest.TestCase):
+
+    def test_paragraph_with_bullets_fails(self):
+        text = "This is a paragraph.\n- bullet one\n- bullet two"
+        violations = validate_output_format(text, "paragraph", "normal")
+        self.assertTrue(any("bullet" in v.lower() for v in violations))
+
+    def test_paragraph_with_headings_fails(self):
+        text = "## Heading\nSome paragraph text."
+        violations = validate_output_format(text, "paragraph", "normal")
+        self.assertTrue(any("heading" in v.lower() for v in violations))
+
+    def test_paragraph_with_table_fails(self):
+        text = "Some text.\n| A | B |\n|---|---|\n| 1 | 2 |"
+        violations = validate_output_format(text, "paragraph", "normal")
+        self.assertTrue(any("table" in v.lower() for v in violations))
+
+    def test_paragraph_clean_passes(self):
+        text = "This is a clean paragraph without any lists or headings."
+        violations = validate_output_format(text, "paragraph", "normal")
+        self.assertEqual(violations, [])
+
+    def test_code_without_code_fails(self):
+        text = "Here is an explanation about coding but no actual code."
+        violations = validate_output_format(text, "code", "normal")
+        self.assertTrue(any("code" in v.lower() for v in violations))
+
+    def test_code_with_block_passes(self):
+        text = "```python\nprint('hello')\n```"
+        violations = validate_output_format(text, "code", "normal")
+        self.assertEqual(violations, [])
+
+    def test_code_with_recognisable_code_passes(self):
+        text = "def hello():\n    return 'world'"
+        violations = validate_output_format(text, "code", "normal")
+        self.assertEqual(violations, [])
+
+    def test_table_without_table_fails(self):
+        text = "Just a paragraph about tables."
+        violations = validate_output_format(text, "table", "normal")
+        self.assertTrue(any("table" in v.lower() for v in violations))
+
+    def test_table_with_table_passes(self):
+        text = "| Name | Value |\n|------|-------|\n| A | 1 |"
+        violations = validate_output_format(text, "table", "normal")
+        self.assertEqual(violations, [])
+
+    def test_single_choice_too_many_lines_fails(self):
+        text = "\n".join(f"Line {i}" for i in range(10))
+        violations = validate_output_format(text, "single_choice", "normal")
+        self.assertTrue(any("single choice" in v.lower() for v in violations))
+
+    def test_single_choice_short_passes(self):
+        text = "Vegan is the best choice."
+        violations = validate_output_format(text, "single_choice", "normal")
+        self.assertEqual(violations, [])
+
+    def test_minimal_brevity_too_long(self):
+        text = "\n".join(f"Line {i}" for i in range(12))
+        violations = validate_output_format(text, "paragraph", "minimal")
+        self.assertTrue(any("minimal" in v.lower() for v in violations))
+
+    def test_short_brevity_too_long(self):
+        text = "\n".join(f"Line {i}" for i in range(25))
+        violations = validate_output_format(text, "paragraph", "short")
+        self.assertTrue(any("short" in v.lower() for v in violations))
+
+    def test_normal_brevity_no_length_check(self):
+        text = "\n".join(f"Line {i}" for i in range(50))
+        violations = validate_output_format(text, "paragraph", "normal")
+        self.assertEqual(violations, [])
+
+    def test_empty_output(self):
+        violations = validate_output_format("", "paragraph", "normal")
+        self.assertTrue(any("empty" in v.lower() for v in violations))
+
+
+class TestFormatViolationsInstruction(unittest.TestCase):
+
+    def test_produces_instruction(self):
+        violations = ["Output has bullets.", "Too many lines."]
+        result = format_violations_instruction(violations)
+        self.assertIn("FORMAT VIOLATIONS", result)
+        self.assertIn("Output has bullets.", result)
+        self.assertIn("Too many lines.", result)
+        self.assertIn("Rewrite", result)
+
+    def test_empty_violations(self):
+        result = format_violations_instruction([])
+        self.assertIn("FORMAT VIOLATIONS", result)
+
+
+# ============================================================
+# Test: Task Assumptions Parsing
+# ============================================================
+
+class TestTaskAssumptions(unittest.TestCase):
+
+    def test_parse_assumptions_basic(self):
+        plan = (
+            "TASK ASSUMPTIONS:\n"
+            "- cost_model: per-unit pricing\n"
+            "- coverage_rate: 95%\n"
+            "- time_frame: 2024 Q4\n"
+            "TASK BREAKDOWN:\n"
+            "1. Do the thing"
+        )
+        result = parse_task_assumptions(plan)
+        self.assertEqual(result["cost_model"], "per-unit pricing")
+        self.assertEqual(result["coverage_rate"], "95%")
+        self.assertEqual(result["time_frame"], "2024 Q4")
+
+    def test_parse_assumptions_missing_section(self):
+        plan = "TASK BREAKDOWN:\n1. Do the thing"
+        result = parse_task_assumptions(plan)
+        self.assertEqual(result, {})
+
+    def test_parse_assumptions_multiple_headers(self):
+        plan = (
+            "TASK ASSUMPTIONS:\n"
+            "units: metric\n"
+            "scope: global\n"
+            "ROLE TO CALL:\n"
+            "Technical Specialist"
+        )
+        result = parse_task_assumptions(plan)
+        self.assertEqual(result["units"], "metric")
+        self.assertEqual(result["scope"], "global")
+        self.assertNotIn("technical_specialist", result)
+
+    def test_parse_assumptions_normalises_keys(self):
+        plan = "TASK ASSUMPTIONS:\nCost Model: expensive\n"
+        result = parse_task_assumptions(plan)
+        self.assertIn("cost_model", result)
+
+    def test_format_assumptions_empty(self):
+        result = format_assumptions_for_prompt({})
+        self.assertEqual(result, "")
+
+    def test_format_assumptions_nonempty(self):
+        result = format_assumptions_for_prompt({"units": "metric", "scope": "global"})
+        self.assertIn("SHARED TASK ASSUMPTIONS", result)
+        self.assertIn("units: metric", result)
+        self.assertIn("scope: global", result)
+        self.assertIn("do NOT invent your own", result)
+
+
+# ============================================================
+# Test: PlannerState Assumptions & Revision Instruction
+# ============================================================
+
+class TestPlannerStateNewFields(unittest.TestCase):
+
+    def test_task_assumptions_in_state_dict(self):
+        ps = PlannerState(user_request="test")
+        ps.task_assumptions = {"units": "metric", "scope": "global"}
+        d = ps.to_state_dict()
+        self.assertEqual(d["task_assumptions"], {"units": "metric", "scope": "global"})
+
+    def test_revision_instruction_in_state_dict(self):
+        ps = PlannerState(user_request="test")
+        ps.revision_instruction = "Fix the table format."
+        d = ps.to_state_dict()
+        self.assertEqual(d["revision_instruction"], "Fix the table format.")
+
+    def test_task_assumptions_in_context_string(self):
+        ps = PlannerState(user_request="test")
+        ps.task_assumptions = {"rate": "5%"}
+        ctx = ps.to_context_string()
+        self.assertIn("rate: 5%", ctx)
+        self.assertIn("Shared assumptions", ctx)
+
+    def test_revision_instruction_in_context_string(self):
+        ps = PlannerState(user_request="test")
+        ps.revision_instruction = "Shorten the output."
+        ctx = ps.to_context_string()
+        self.assertIn("Shorten the output.", ctx)
+
+    def test_empty_assumptions_not_in_context(self):
+        ps = PlannerState(user_request="test")
+        ctx = ps.to_context_string()
+        self.assertNotIn("Shared assumptions", ctx)
+
+
+# ============================================================
+# Test: Task-Aware Scenarios
 # ============================================================
 
 class TestTaskAwareScenarios(unittest.TestCase):

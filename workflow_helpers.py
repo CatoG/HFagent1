@@ -523,6 +523,11 @@ def select_relevant_roles(
             if kw.lower() in lower:
                 score += 1
 
+        # Domain affinity — boost if the request touches a role's domain
+        for domain in meta.get("domains", []):
+            if domain.lower() in lower:
+                score += 1
+
         # Task-category affinity bonus
         role_tasks = meta.get("task_types", [])
         if task_category in role_tasks:
@@ -751,10 +756,12 @@ class PlannerState:
     selected_roles: List[str] = field(default_factory=list)
     specialist_outputs: Dict[str, str] = field(default_factory=dict)
     evidence: Optional[Dict] = None  # serialised EvidenceResult
+    task_assumptions: Dict[str, str] = field(default_factory=dict)
     current_draft: str = ""
     qa_result: Optional[QAResult] = None
     revision_count: int = 0
     max_revisions: int = 3
+    revision_instruction: str = ""  # latest revision instruction from planner
     failure_history: List[FailureRecord] = field(default_factory=list)
     history: List[Dict[str, str]] = field(default_factory=list)
     final_answer: str = ""
@@ -829,10 +836,15 @@ class PlannerState:
         ]
         if self.success_criteria:
             lines.append(f"Success criteria: {'; '.join(self.success_criteria)}")
+        if self.task_assumptions:
+            assumptions_str = "; ".join(f"{k}: {v}" for k, v in self.task_assumptions.items())
+            lines.append(f"Shared assumptions: {assumptions_str}")
         if self.evidence:
             conf = self.evidence.get("confidence", "unknown")
             n_items = len(self.evidence.get("results", []))
             lines.append(f"Evidence: {n_items} items (confidence: {conf})")
+        if self.revision_instruction:
+            lines.append(f"Revision instruction: {self.revision_instruction}")
         if self.qa_result and not self.qa_result.passed:
             lines.append(f"QA status: FAIL — {self.qa_result.reason}")
             if self.qa_result.correction_instruction:
@@ -856,9 +868,11 @@ class PlannerState:
             "selected_roles": self.selected_roles,
             "specialist_outputs": self.specialist_outputs,
             "evidence": self.evidence,
+            "task_assumptions": self.task_assumptions,
             "current_draft": self.current_draft[:500],
             "revision_count": self.revision_count,
             "max_revisions": self.max_revisions,
+            "revision_instruction": self.revision_instruction,
             "failure_history": [f.to_dict() for f in self.failure_history],
             "final_answer": self.final_answer[:500] if self.final_answer else "",
         }
@@ -931,3 +945,114 @@ def get_qa_format_instruction(output_format: str, brevity: str) -> str:
     if brevity in ("minimal", "short"):
         rules.append("FAIL if the output is excessively verbose for a brevity requirement.")
     return "\n".join(rules) if rules else ""
+
+
+# ============================================================
+# Output Format Validation (pre-QA structural check)
+# ============================================================
+
+def validate_output_format(text: str, output_format: str, brevity: str) -> List[str]:
+    """Check structural format constraints before QA.
+
+    Returns a list of violation descriptions. Empty list means the output is valid.
+    This catches common structural problems that the synthesizer repeatedly ignores
+    (e.g., bullet lists when paragraph-only was requested).
+    """
+    violations: List[str] = []
+    stripped = text.strip()
+    if not stripped:
+        violations.append("Output is empty.")
+        return violations
+
+    has_bullets = bool(re.search(r"^[\s]*[-•*]\s", stripped, re.MULTILINE))
+    has_numbered = bool(re.search(r"^[\s]*\d+[.)]\s", stripped, re.MULTILINE))
+    has_headings = bool(re.search(r"^#{1,4}\s", stripped, re.MULTILINE))
+    has_table = bool(re.search(r"\|.*\|.*\|", stripped))
+    has_code_block = "```" in stripped
+    line_count = len([ln for ln in stripped.splitlines() if ln.strip()])
+
+    if output_format == "paragraph":
+        if has_bullets or has_numbered:
+            violations.append("Paragraph format requested but output contains bullet/numbered lists.")
+        if has_headings:
+            violations.append("Paragraph format requested but output contains markdown headings.")
+        if has_table:
+            violations.append("Paragraph format requested but output contains a table.")
+
+    elif output_format == "code":
+        if not has_code_block and not re.search(r"(?:def |class |import |function |const |let |var )", stripped):
+            violations.append("Code format requested but output contains no code block or recognisable code.")
+
+    elif output_format == "table":
+        if not has_table:
+            violations.append("Table format requested but output contains no markdown table.")
+
+    elif output_format == "single_choice":
+        if line_count > 5:
+            violations.append("Single choice requested but output is multi-section (too many lines).")
+        if has_bullets and line_count > 3:
+            violations.append("Single choice requested but output contains a bullet list.")
+
+    # Brevity checks
+    if brevity == "minimal" and line_count > 8:
+        violations.append(f"Minimal brevity requested but output has {line_count} lines.")
+    elif brevity == "short" and line_count > 20:
+        violations.append(f"Short brevity requested but output has {line_count} lines.")
+
+    return violations
+
+
+def format_violations_instruction(violations: List[str]) -> str:
+    """Turn format violation descriptions into a synthesis rewrite instruction."""
+    return (
+        "FORMAT VIOLATIONS DETECTED — you MUST fix these before QA:\n"
+        + "\n".join(f"- {v}" for v in violations)
+        + "\nRewrite the output to satisfy the required format strictly."
+    )
+
+
+# ============================================================
+# Shared Assumptions Parsing
+# ============================================================
+
+def parse_task_assumptions(plan_text: str) -> Dict[str, str]:
+    """Extract TASK ASSUMPTIONS from planner output.
+
+    Looks for lines like 'key: value' under a TASK ASSUMPTIONS: header.
+    Returns a dict of assumption key → value.
+    """
+    assumptions: Dict[str, str] = {}
+    if "TASK ASSUMPTIONS:" not in plan_text:
+        return assumptions
+
+    section = plan_text.split("TASK ASSUMPTIONS:", 1)[1]
+    # Section ends at the next header (a line that ends with ':' and starts with caps)
+    for header in (
+        "TASK BREAKDOWN:", "ROLE TO CALL:", "SUCCESS CRITERIA:",
+        "GUIDANCE FOR SPECIALIST:", "REVISED INSTRUCTIONS:",
+    ):
+        if header in section:
+            section = section.split(header, 1)[0]
+            break
+
+    for line in section.strip().splitlines():
+        line = line.strip().lstrip("•-* ")
+        if ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        key = key.strip().lower().replace(" ", "_")
+        value = value.strip()
+        if key and value:
+            assumptions[key] = value
+
+    return assumptions
+
+
+def format_assumptions_for_prompt(assumptions: Dict[str, str]) -> str:
+    """Format shared assumptions for injection into specialist prompts."""
+    if not assumptions:
+        return ""
+    lines = ["SHARED TASK ASSUMPTIONS (use these — do NOT invent your own):"]
+    for key, value in assumptions.items():
+        lines.append(f"  - {key}: {value}")
+    return "\n".join(lines)
