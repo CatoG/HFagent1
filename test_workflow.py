@@ -5,11 +5,14 @@ Tests cover:
 1. Output format detection
 2. Brevity detection
 3. Structured QA parsing (JSON and legacy)
-4. Role relevance selection
+4. Role relevance selection (with task-category awareness)
 5. Targeted revision identification
 6. Internal noise stripping
 7. Final answer compression
-8. End-to-end workflow scenarios (mocked LLM)
+8. Task classification
+9. Evidence system (EvidenceResult, adapters, claim detection)
+10. Planner state (failure tracking, escalation, state serialisation)
+11. End-to-end workflow scenarios
 """
 
 import json
@@ -19,6 +22,8 @@ from workflow_helpers import (
     WorkflowConfig,
     detect_output_format,
     detect_brevity_requirement,
+    classify_task,
+    task_needs_evidence,
     QAIssue,
     QAResult,
     parse_structured_qa,
@@ -27,8 +32,19 @@ from workflow_helpers import (
     strip_internal_noise,
     compress_final_answer,
     PlannerState,
+    FailureRecord,
     get_synthesizer_format_instruction,
     get_qa_format_instruction,
+)
+from evidence import (
+    EvidenceItem,
+    EvidenceResult,
+    gather_evidence,
+    extract_search_queries,
+    detect_unsupported_claims,
+    format_evidence_for_prompt,
+    format_evidence_for_qa,
+    ResearchToolAdapter,
 )
 
 
@@ -554,6 +570,522 @@ class TestWorkflowScenarios(unittest.TestCase):
         )
         targets = identify_revision_targets(qa, role_map)
         self.assertIn("research", targets)
+
+
+# ============================================================
+# Test: Task Classification
+# ============================================================
+
+class TestTaskClassification(unittest.TestCase):
+
+    def test_factual_question(self):
+        self.assertEqual(classify_task("What is the capital of France?"), "factual_question")
+
+    def test_factual_who(self):
+        self.assertEqual(classify_task("Who is the CEO of Microsoft?"), "factual_question")
+
+    def test_coding_task(self):
+        self.assertEqual(classify_task("Write Python code to parse a CSV and count rows"), "coding_task")
+
+    def test_coding_task_implement(self):
+        self.assertEqual(classify_task("Implement a binary search in Rust"), "coding_task")
+
+    def test_creative_writing(self):
+        self.assertEqual(classify_task("Write a short poem about rain"), "creative_writing")
+
+    def test_comparison(self):
+        self.assertEqual(classify_task("Compare two approaches to urban planning"), "comparison")
+
+    def test_comparison_vs(self):
+        self.assertEqual(classify_task("Python vs Rust for web servers"), "comparison")
+
+    def test_summarization(self):
+        self.assertEqual(classify_task("Summarize the key findings of the report"), "summarization")
+
+    def test_analysis(self):
+        self.assertEqual(classify_task("Evaluate the effectiveness of remote work policies"), "analysis")
+
+    def test_planning(self):
+        self.assertEqual(classify_task("Create a roadmap for our product launch"), "planning")
+
+    def test_opinion_discussion(self):
+        self.assertEqual(
+            classify_task("Discuss the role of black metal music in modern culture from 2 different perspectives"),
+            "opinion_discussion",
+        )
+
+    def test_other_fallback(self):
+        self.assertEqual(classify_task("hello"), "other")
+
+    def test_needs_evidence_factual(self):
+        self.assertTrue(task_needs_evidence("factual_question"))
+
+    def test_needs_evidence_comparison(self):
+        self.assertTrue(task_needs_evidence("comparison"))
+
+    def test_needs_evidence_analysis(self):
+        self.assertTrue(task_needs_evidence("analysis"))
+
+    def test_needs_evidence_summarization(self):
+        self.assertTrue(task_needs_evidence("summarization"))
+
+    def test_no_evidence_coding(self):
+        self.assertFalse(task_needs_evidence("coding_task"))
+
+    def test_no_evidence_creative(self):
+        self.assertFalse(task_needs_evidence("creative_writing"))
+
+    def test_no_evidence_opinion(self):
+        self.assertFalse(task_needs_evidence("opinion_discussion"))
+
+    def test_no_evidence_other(self):
+        self.assertFalse(task_needs_evidence("other"))
+
+
+# ============================================================
+# Test: Evidence System
+# ============================================================
+
+class _MockAdapter(ResearchToolAdapter):
+    """Test adapter that returns canned results."""
+
+    def __init__(self, items: list = None, fail: bool = False):
+        self._items = items or []
+        self._fail = fail
+
+    @property
+    def name(self) -> str:
+        return "Mock"
+
+    @property
+    def source_type(self) -> str:
+        return "mock"
+
+    def search(self, query: str) -> list:
+        if self._fail:
+            raise RuntimeError("mock failure")
+        return self._items
+
+
+class TestEvidenceSystem(unittest.TestCase):
+
+    # --- EvidenceItem ---
+
+    def test_evidence_item_to_dict(self):
+        item = EvidenceItem(title="T", source="web", snippet="S", url="http://x")
+        d = item.to_dict()
+        self.assertEqual(d["title"], "T")
+        self.assertEqual(d["url"], "http://x")
+
+    # --- EvidenceResult ---
+
+    def test_evidence_result_empty(self):
+        er = EvidenceResult(query="q")
+        self.assertFalse(er.has_evidence)
+        self.assertEqual(er.confidence, "low")
+
+    def test_evidence_result_has_evidence(self):
+        er = EvidenceResult(query="q", results=[
+            EvidenceItem(title="T", source="web", snippet="S"),
+        ])
+        self.assertTrue(er.has_evidence)
+
+    def test_evidence_result_to_dict(self):
+        er = EvidenceResult(query="q", results=[
+            EvidenceItem(title="T", source="web", snippet="S"),
+        ], confidence="medium")
+        d = er.to_dict()
+        self.assertEqual(d["query"], "q")
+        self.assertEqual(len(d["results"]), 1)
+        self.assertEqual(d["confidence"], "medium")
+
+    def test_evidence_result_merge(self):
+        er1 = EvidenceResult(query="q1", results=[
+            EvidenceItem(title="A", source="web", snippet="a"),
+        ], confidence="low")
+        er2 = EvidenceResult(query="q2", results=[
+            EvidenceItem(title="B", source="wiki", snippet="b"),
+        ], confidence="high")
+        er1.merge(er2)
+        self.assertEqual(len(er1.results), 2)
+        self.assertEqual(er1.confidence, "high")
+
+    def test_evidence_result_merge_medium_beats_low(self):
+        er1 = EvidenceResult(query="q1", confidence="low")
+        er2 = EvidenceResult(query="q2", confidence="medium")
+        er1.merge(er2)
+        self.assertEqual(er1.confidence, "medium")
+
+    # --- gather_evidence ---
+
+    def test_gather_evidence_basic(self):
+        items = [
+            EvidenceItem(title="R1", source="mock", snippet="data1"),
+            EvidenceItem(title="R2", source="mock", snippet="data2"),
+        ]
+        adapter = _MockAdapter(items=items)
+        result = gather_evidence(["test query"], [adapter])
+        self.assertEqual(len(result.results), 2)
+        self.assertIn(result.confidence, ("medium", "high"))
+
+    def test_gather_evidence_multi_adapter_high_confidence(self):
+        web_items = [
+            EvidenceItem(title="W1", source="web", snippet="w"),
+            EvidenceItem(title="W2", source="web", snippet="w"),
+        ]
+        wiki_items = [
+            EvidenceItem(title="K1", source="wiki", snippet="k"),
+        ]
+        result = gather_evidence(
+            ["test"],
+            [_MockAdapter(items=web_items), _MockAdapter(items=wiki_items)],
+        )
+        self.assertEqual(result.confidence, "high")
+        self.assertEqual(len(result.results), 3)
+
+    def test_gather_evidence_empty(self):
+        result = gather_evidence(["test"], [_MockAdapter(items=[])])
+        self.assertFalse(result.has_evidence)
+        self.assertEqual(result.confidence, "low")
+
+    def test_gather_evidence_adapter_failure_graceful(self):
+        result = gather_evidence(["test"], [_MockAdapter(fail=True)])
+        self.assertFalse(result.has_evidence)
+        self.assertEqual(result.confidence, "low")
+
+    # --- extract_search_queries ---
+
+    def test_extract_queries_basic(self):
+        queries = extract_search_queries("What are the biggest AI news stories this week?")
+        self.assertTrue(len(queries) >= 1)
+        self.assertIn("biggest", queries[0].lower())
+
+    def test_extract_queries_with_plan(self):
+        plan = "KEY FINDINGS:\n- Large language models are evolving rapidly"
+        queries = extract_search_queries("AI news", plan)
+        self.assertTrue(len(queries) >= 2)
+
+    def test_extract_queries_max_three(self):
+        plan = "KEY FINDINGS:\n- Point one\n- Point two\n- Point three"
+        queries = extract_search_queries("query", plan)
+        self.assertLessEqual(len(queries), 3)
+
+    # --- detect_unsupported_claims ---
+
+    def test_detect_unsupported_no_claims(self):
+        evidence = EvidenceResult(query="q", results=[
+            EvidenceItem(title="T", source="web", snippet="general info"),
+        ])
+        claims = detect_unsupported_claims("This is a normal sentence.", evidence)
+        self.assertEqual(len(claims), 0)
+
+    def test_detect_unsupported_fake_citation(self):
+        evidence = EvidenceResult(query="q", results=[
+            EvidenceItem(title="T", source="web", snippet="some info about cats"),
+        ])
+        text = 'According to Dr. Smith, published in 2023, the Feline Research Institute found a 15% increase.'
+        claims = detect_unsupported_claims(text, evidence)
+        # Should detect at least one unsupported claim
+        self.assertTrue(len(claims) >= 1)
+
+    # --- format_evidence_for_prompt ---
+
+    def test_format_evidence_no_results(self):
+        evidence = EvidenceResult(query="q")
+        formatted = format_evidence_for_prompt(evidence)
+        self.assertIn("No evidence", formatted)
+
+    def test_format_evidence_with_results(self):
+        evidence = EvidenceResult(query="q", results=[
+            EvidenceItem(title="Title1", source="web", snippet="Snippet1"),
+        ], confidence="medium")
+        formatted = format_evidence_for_prompt(evidence)
+        self.assertIn("RETRIEVED EVIDENCE", formatted)
+        self.assertIn("Title1", formatted)
+        self.assertIn("medium", formatted)
+        self.assertIn("RULE", formatted)
+
+    # --- format_evidence_for_qa ---
+
+    def test_format_evidence_qa_no_results(self):
+        evidence = EvidenceResult(query="q")
+        formatted = format_evidence_for_qa(evidence)
+        self.assertIn("EVIDENCE VALIDATION", formatted)
+        self.assertIn("FAIL", formatted)
+
+    def test_format_evidence_qa_with_results(self):
+        evidence = EvidenceResult(query="q", results=[
+            EvidenceItem(title="T", source="web", snippet="S"),
+        ], confidence="high")
+        formatted = format_evidence_for_qa(evidence)
+        self.assertIn("1 items retrieved", formatted)
+        self.assertIn("high", formatted)
+
+
+# ============================================================
+# Test: Failure Tracking & Escalation
+# ============================================================
+
+class TestFailureTracking(unittest.TestCase):
+
+    def test_failure_record_to_dict(self):
+        fr = FailureRecord(revision=0, owner="research", issue_type="accuracy",
+                           message="Wrong fact", correction="Fix it")
+        d = fr.to_dict()
+        self.assertEqual(d["revision"], 0)
+        self.assertEqual(d["owner"], "research")
+        self.assertEqual(d["issue_type"], "accuracy")
+
+    def test_record_failure_from_qa(self):
+        ps = PlannerState(user_request="test")
+        qa = QAResult(
+            status="FAIL", reason="Issues found",
+            correction_instruction="Correct it",
+            issues=[
+                QAIssue(type="accuracy", owner="research",
+                        message="Wrong data"),
+            ],
+        )
+        ps.record_failure(qa)
+        self.assertEqual(len(ps.failure_history), 1)
+        self.assertEqual(ps.failure_history[0].owner, "research")
+
+    def test_has_repeated_failure(self):
+        ps = PlannerState(user_request="test")
+        # First failure at revision 0
+        qa = QAResult(
+            status="FAIL", reason="bad",
+            correction_instruction="fix",
+            issues=[
+                QAIssue(type="accuracy", owner="research",
+                        message="err"),
+            ],
+        )
+        ps.record_failure(qa)
+        # Advance revision
+        ps.revision_count = 1
+        # Same failure should be detected
+        self.assertTrue(ps.has_repeated_failure("research", "accuracy"))
+
+    def test_no_repeated_failure(self):
+        ps = PlannerState(user_request="test")
+        self.assertFalse(ps.has_repeated_failure("research", "accuracy"))
+
+    def test_get_repeat_failures(self):
+        ps = PlannerState(user_request="test")
+        # Add same failure type twice
+        qa = QAResult(
+            status="FAIL", reason="bad",
+            correction_instruction="fix",
+            issues=[
+                QAIssue(type="accuracy", owner="research",
+                        message="err"),
+            ],
+        )
+        ps.record_failure(qa)
+        ps.revision_count = 1
+        ps.record_failure(qa)
+        repeats = ps.get_repeat_failures()
+        self.assertIn(("research", "accuracy"), repeats)
+
+    def test_escalation_none(self):
+        ps = PlannerState(user_request="test")
+        self.assertEqual(ps.get_escalation_strategy(), "none")
+
+    def test_escalation_suppress_role(self):
+        ps = PlannerState(user_request="test")
+        qa = QAResult(
+            status="FAIL", reason="bad",
+            correction_instruction="fix",
+            issues=[
+                QAIssue(type="accuracy", owner="research",
+                        message="err"),
+            ],
+        )
+        ps.record_failure(qa)
+        ps.revision_count = 1
+        ps.record_failure(qa)
+        self.assertEqual(ps.get_escalation_strategy(), "suppress_role")
+
+    def test_escalation_rewrite_from_state(self):
+        ps = PlannerState(user_request="test")
+        qa = QAResult(
+            status="FAIL", reason="bad",
+            correction_instruction="fix format",
+            issues=[
+                QAIssue(type="format", owner="synthesizer",
+                        message="wrong format"),
+            ],
+        )
+        ps.record_failure(qa)
+        ps.revision_count = 1
+        ps.record_failure(qa)
+        self.assertEqual(ps.get_escalation_strategy(), "rewrite_from_state")
+
+    def test_get_roles_to_suppress(self):
+        ps = PlannerState(user_request="test")
+        qa = QAResult(
+            status="FAIL", reason="bad",
+            correction_instruction="fix",
+            issues=[
+                QAIssue(type="accuracy", owner="creative",
+                        message="err"),
+            ],
+        )
+        ps.record_failure(qa)
+        ps.revision_count = 1
+        ps.record_failure(qa)
+        suppressed = ps.get_roles_to_suppress()
+        self.assertIn("creative", suppressed)
+        self.assertNotIn("synthesizer", suppressed)
+
+
+# ============================================================
+# Test: Extended PlannerState
+# ============================================================
+
+class TestPlannerStateExtended(unittest.TestCase):
+
+    def test_to_state_dict(self):
+        ps = PlannerState(
+            user_request="test req",
+            task_category="factual_question",
+            selected_roles=["research", "technical"],
+        )
+        ps.specialist_outputs["research"] = "some output"
+        d = ps.to_state_dict()
+        self.assertEqual(d["task_category"], "factual_question")
+        self.assertEqual(d["specialist_outputs"]["research"], "some output")
+        self.assertIn("selected_roles", d)
+
+    def test_to_state_dict_truncates_draft(self):
+        ps = PlannerState(user_request="test")
+        ps.current_draft = "X" * 1000
+        d = ps.to_state_dict()
+        self.assertEqual(len(d["current_draft"]), 500)
+
+    def test_evidence_field(self):
+        ps = PlannerState(user_request="test")
+        er = EvidenceResult(query="q", results=[
+            EvidenceItem(title="T", source="web", snippet="S"),
+        ])
+        ps.evidence = er.to_dict()
+        self.assertIsNotNone(ps.evidence)
+        self.assertEqual(ps.evidence["query"], "q")
+
+    def test_context_string_includes_category(self):
+        ps = PlannerState(
+            user_request="test",
+            task_category="comparison",
+        )
+        ctx = ps.to_context_string()
+        self.assertIn("comparison", ctx)
+
+    def test_context_string_includes_failures(self):
+        ps = PlannerState(user_request="test")
+        qa = QAResult(
+            status="FAIL", reason="bad",
+            correction_instruction="fix",
+            issues=[
+                QAIssue(type="accuracy", owner="research",
+                        message="err"),
+            ],
+        )
+        ps.record_failure(qa)
+        ctx = ps.to_context_string()
+        self.assertIn("failure", ctx.lower())
+
+    def test_context_string_includes_escalation(self):
+        ps = PlannerState(user_request="test")
+        qa = QAResult(
+            status="FAIL", reason="bad",
+            correction_instruction="fix",
+            issues=[
+                QAIssue(type="accuracy", owner="research",
+                        message="err"),
+            ],
+        )
+        ps.record_failure(qa)
+        ps.revision_count = 1
+        ps.record_failure(qa)
+        ctx = ps.to_context_string()
+        self.assertIn("suppress_role", ctx)
+
+    def test_final_answer_tracking(self):
+        ps = PlannerState(user_request="test")
+        ps.final_answer = "The answer is 42."
+        self.assertEqual(ps.final_answer, "The answer is 42.")
+        d = ps.to_state_dict()
+        self.assertEqual(d["final_answer"], "The answer is 42.")
+
+
+# ============================================================
+# Test: Scenario - Role Selection with Task Categories
+# ============================================================
+
+class TestTaskAwareScenarios(unittest.TestCase):
+    """End-to-end scenario tests validating the 4 user-specified cases."""
+
+    def _all_roles(self):
+        return list(WorkflowConfig.CORE_ROLE_KEYS) + list(WorkflowConfig.PERSONA_ROLE_KEYS)
+
+    # Scenario 1: Black metal discussion
+    def test_black_metal_discussion(self):
+        req = "discuss the role of black metal music in modern culture from 2 different perspectives"
+        cat = classify_task(req)
+        self.assertEqual(cat, "opinion_discussion")
+        # Opinion discussion does not need evidence
+        self.assertFalse(task_needs_evidence(cat))
+        # Strict mode, no personas
+        config = WorkflowConfig(strict_mode=True, allow_persona_roles=False)
+        roles = select_relevant_roles(req, self._all_roles(), config, task_category=cat)
+        # Should not include persona roles
+        for persona in WorkflowConfig.PERSONA_ROLE_KEYS:
+            self.assertNotIn(persona, roles)
+        # Should have minimal roles (<=3)
+        self.assertLessEqual(len(roles), config.max_specialists_per_task)
+
+    # Scenario 2: AI news stories
+    def test_ai_news_stories(self):
+        req = "what are the three biggest AI news stories this week?"
+        cat = classify_task(req)
+        self.assertEqual(cat, "factual_question")
+        # Factual question needs evidence
+        self.assertTrue(task_needs_evidence(cat))
+        # Research should be auto-included
+        config = WorkflowConfig(always_include_research_for_factual_tasks=True)
+        roles = select_relevant_roles(req, self._all_roles(), config, task_category=cat)
+        self.assertIn("research", roles)
+
+    # Scenario 3: Python CSV code
+    def test_python_csv_code(self):
+        req = "write Python code to parse a CSV and count rows"
+        cat = classify_task(req)
+        self.assertEqual(cat, "coding_task")
+        # Coding task does not need evidence
+        self.assertFalse(task_needs_evidence(cat))
+        # Technical should be preferred
+        config = WorkflowConfig(strict_mode=True)
+        roles = select_relevant_roles(req, self._all_roles(), config, task_category=cat)
+        self.assertIn("technical", roles)
+        # Output format should be code
+        fmt = detect_output_format(req)
+        self.assertEqual(fmt, "code")
+
+    # Scenario 4: Urban planning comparison
+    def test_urban_planning_comparison(self):
+        req = "compare two approaches to urban planning in one short paragraph"
+        cat = classify_task(req)
+        self.assertEqual(cat, "comparison")
+        # Comparison needs evidence
+        self.assertTrue(task_needs_evidence(cat))
+        # Brevity should be short
+        brevity = detect_brevity_requirement(req)
+        self.assertIn(brevity, ("short", "minimal"))
+        # Should have minimal roles
+        config = WorkflowConfig(strict_mode=True, max_specialists_per_task=3)
+        roles = select_relevant_roles(req, self._all_roles(), config, task_category=cat)
+        self.assertLessEqual(len(roles), 3)
 
 
 if __name__ == "__main__":

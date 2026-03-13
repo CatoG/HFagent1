@@ -14,12 +14,21 @@ from dotenv import load_dotenv
 from workflow_helpers import (
     WorkflowConfig, DEFAULT_CONFIG,
     detect_output_format, detect_brevity_requirement,
+    classify_task, task_needs_evidence,
     QAResult, parse_structured_qa,
-    PlannerState,
+    PlannerState, FailureRecord,
     select_relevant_roles, identify_revision_targets,
     compress_final_answer, strip_internal_noise,
     get_synthesizer_format_instruction, get_qa_format_instruction,
     ROLE_RELEVANCE,
+)
+from evidence import (
+    EvidenceResult, EvidenceItem,
+    WebSearchAdapter, WikipediaAdapter, ArxivAdapter,
+    ResearchToolAdapter,
+    gather_evidence, extract_search_queries,
+    detect_unsupported_claims,
+    format_evidence_for_prompt, format_evidence_for_qa,
 )
 
 warnings.filterwarnings("ignore", category=UserWarning, module="wikipedia")
@@ -136,6 +145,21 @@ arxiv_tool = ArxivQueryRun(
         doc_content_chars_max=1200,
     )
 )
+
+
+# ============================================================
+# Research tool adapters for evidence-backed retrieval
+# ============================================================
+
+def _build_research_adapters() -> List[ResearchToolAdapter]:
+    """Build available research tool adapters from the shared wrappers."""
+    adapters: List[ResearchToolAdapter] = []
+    if ddg_search is not None:
+        adapters.append(WebSearchAdapter(ddg_search.run))
+    wiki = WikipediaAPIWrapper()
+    adapters.append(WikipediaAdapter(wiki.run))
+    adapters.append(ArxivAdapter(arxiv_tool.run))
+    return adapters
 
 
 # ============================================================
@@ -639,9 +663,9 @@ _QA_SYSTEM = (
     '  \"reason\": \"short explanation\",\n'
     '  \"issues\": [\n'
     '    {\n'
-    '      \"type\": \"format\" | \"brevity\" | \"constraint\" | \"consistency\" | \"directness\" | \"other\",\n'
+    '      \"type\": \"format\" | \"brevity\" | \"constraint\" | \"consistency\" | \"directness\" | \"evidence\" | \"other\",\n'
     '      \"message\": \"what is wrong\",\n'
-    '      \"owner\": \"Synthesizer\" | \"Planner\" | \"<specialist role name>\"\n'
+    '      \"owner\": \"Synthesizer\" | \"Planner\" | \"Research Analyst\" | \"<specialist role name>\"\n'
     '    }\n'
     '  ],\n'
     '  \"correction_instruction\": \"specific minimal fix\"\n'
@@ -651,6 +675,9 @@ _QA_SYSTEM = (
     "- Check that the output format matches what was requested (single choice, table, code, etc.).\n"
     "- Check that brevity matches the requirement (do not accept verbose answers when short was requested).\n"
     "- Check that no internal workflow noise (task breakdown, role routing, perspectives summary) is in the output.\n"
+    "- EVIDENCE CHECK: If evidence validation info is provided, FAIL any answer that includes\n"
+    "  specific factual claims, case studies, named examples, or citations NOT backed by the\n"
+    "  retrieved evidence. General knowledge and widely-known facts are acceptable.\n"
     "- FAIL if any of the above checks fail.\n"
     "- PASS only if ALL checks pass.\n"
 )
@@ -676,12 +703,19 @@ _PLANNER_REVIEW_SYSTEM = (
 
 _RESEARCH_SYSTEM = (
     "You are the Research Analyst in a multi-role AI workflow.\n"
-    "You gather information, review existing literature, and summarize facts relevant to the task.\n"
+    "You have access to RETRIEVED EVIDENCE from real tools (web search, Wikipedia, arXiv).\n"
+    "Your job is to summarize the retrieved evidence, NOT to invent facts.\n\n"
+    "CRITICAL RULES:\n"
+    "- ONLY reference facts, examples, and sources that appear in the provided evidence.\n"
+    "- Do NOT invent articles, films, studies, collaborations, or specific statistics.\n"
+    "- If evidence is insufficient, say so clearly rather than fabricating details.\n"
+    "- Mark your confidence as 'high', 'medium', or 'low' based on evidence quality.\n\n"
     "Keep your response brief — 2-3 sentences per section maximum.\n\n"
     "Respond in this exact format:\n"
-    "SOURCES CONSULTED:\n<list of sources, references, or knowledge domains used>\n\n"
-    "KEY FINDINGS:\n<factual information gathered and synthesized>\n\n"
-    "RESEARCH SUMMARY:\n<a comprehensive summary of findings relevant to the request>"
+    "EVIDENCE SUMMARY:\n<what the retrieved evidence shows>\n\n"
+    "KEY FINDINGS:\n<factual information from the evidence, with source attribution>\n\n"
+    "CONFIDENCE: <high | medium | low>\n\n"
+    "GAPS:\n<what could not be verified — if any>"
 )
 
 _SECURITY_SYSTEM = (
@@ -787,7 +821,11 @@ _SYNTHESIZER_SYSTEM = (
     "  'Tensions', or any multi-section structure UNLESS the user explicitly requested\n"
     "  a report or analysis.\n"
     "- Do NOT include internal workflow information (role names, task breakdowns, etc.).\n"
-    "- Default to the SHORTEST adequate answer.\n\n"
+    "- Default to the SHORTEST adequate answer.\n"
+    "- EVIDENCE RULE: Prefer claims backed by retrieved evidence. If evidence is weak or\n"
+    "  absent, give a general answer. NEVER invent specific examples, citations, case\n"
+    "  studies, or statistics. If you must reference something specific, it MUST appear\n"
+    "  in the evidence provided.\n\n"
     "Output ONLY the final answer in the requested format. Nothing else."
 )
 
@@ -1080,9 +1118,10 @@ def _step_qa(
     state: WorkflowState,
     trace: List[str],
     all_outputs: Optional[List[Tuple[str, str]]] = None,
+    evidence: Optional[EvidenceResult] = None,
 ) -> WorkflowState:
     """QA Tester: validate the draft against the original request, success criteria,
-    output format, and brevity requirements.
+    output format, brevity requirements, and evidence grounding.
 
     Produces a structured QAResult stored in state['qa_structured'].
     """
@@ -1100,6 +1139,10 @@ def _step_qa(
     )
     if format_rules:
         content += f"FORMAT VALIDATION RULES:\n{format_rules}\n\n"
+
+    # Inject evidence validation context
+    if evidence is not None:
+        content += f"{format_evidence_for_qa(evidence)}\n\n"
 
     if all_outputs:
         content += "Individual specialist contributions:\n\n"
@@ -1208,13 +1251,36 @@ def _step_planner_review(
     return state
 
 
-def _step_research(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowState:
-    """Research Analyst: gather information and produce a comprehensive research summary."""
+def _step_research(
+    chat_model,
+    state: WorkflowState,
+    trace: List[str],
+    evidence: Optional[EvidenceResult] = None,
+) -> WorkflowState:
+    """Research Analyst: summarise tool-retrieved evidence into structured findings.
+
+    If an EvidenceResult is provided, it is injected into the prompt so the
+    Research Analyst works from real retrieved data rather than generating text.
+    If no evidence is available, the analyst is instructed to reason generally
+    and avoid inventing specific citations.
+    """
     trace.append("\n╔══ [RESEARCH ANALYST] Gathering information... ══╗")
     content = (
         f"User request: {state['user_request']}\n\n"
         f"Planner instructions:\n{state['plan']}"
     )
+
+    # Inject tool-retrieved evidence
+    if evidence and evidence.has_evidence:
+        content += f"\n\n{format_evidence_for_prompt(evidence)}"
+        trace.append(f"  ℹ Evidence injected: {len(evidence.results)} items (confidence: {evidence.confidence})")
+    else:
+        content += (
+            "\n\nNo tool-retrieved evidence is available for this query.\n"
+            "Provide general knowledge only. Do NOT invent specific citations, "
+            "articles, studies, or examples."
+        )
+
     if state["revision_count"] > 0:
         role_feedback = state["qa_role_feedback"].get("research", "")
         if role_feedback:
@@ -1507,10 +1573,12 @@ def _step_synthesize(
     state: WorkflowState,
     trace: List[str],
     all_outputs: List[Tuple[str, str]],
+    evidence: Optional[EvidenceResult] = None,
 ) -> WorkflowState:
     """Synthesizer: produce the final user-facing answer from specialist contributions.
 
     Obeys the detected output format and brevity requirement strictly.
+    If evidence is available, injects it so the synthesizer prefers grounded claims.
     """
     trace.append("\n╔══ [SYNTHESIZER] Producing final answer... ══╗")
     perspectives = []
@@ -1529,8 +1597,16 @@ def _step_synthesize(
         f"REQUIRED OUTPUT FORMAT: {fmt}\n"
         f"BREVITY: {brevity}\n\n"
         f"{format_instruction}\n\n"
-        f"Specialist contributions:\n\n{combined}"
     )
+
+    # Inject evidence context for the synthesizer
+    if evidence and evidence.has_evidence:
+        content += (
+            f"{format_evidence_for_prompt(evidence)}\n\n"
+        )
+
+    content += f"Specialist contributions:\n\n{combined}"
+
     text = _llm_call(chat_model, _SYNTHESIZER_SYSTEM, content)
     state["synthesis_output"] = text
     state["draft_output"] = text
@@ -1755,15 +1831,16 @@ def run_multi_role_workflow(
     """Run the strict planner–specialist–synthesizer–QA workflow.
 
     Flow:
-      1. Detect output format and brevity from the user request.
-      2. Planner (if active) analyses the task and picks a primary specialist.
-      3. Role selection filters to only relevant specialists (not all active roles).
-      4. Selected specialists run and contribute.
-      5. Synthesizer produces a format-aware final answer.
-      6. QA validates against format, brevity, and correctness.
-      7. QA-BINDING: if FAIL, planner MUST revise. Code enforces this.
-      8. Targeted revisions: only rerun failing role(s), not the whole set.
-      9. Final answer is compressed and stripped of internal noise.
+      1. Classify task and detect output format / brevity.
+      2. Retrieve evidence via tool adapters (for factual tasks).
+      3. Planner analyses the task and picks a primary specialist.
+      4. Dynamic role selection filters to only relevant specialists.
+      5. Selected specialists run (research analyst gets evidence injected).
+      6. Synthesizer produces a format-aware, evidence-grounded answer.
+      7. QA validates against format, brevity, evidence, and correctness.
+      8. QA-BINDING: if FAIL, planner MUST revise. Code enforces this.
+      9. Targeted revisions with escalation on repeated failures.
+     10. Final answer is compressed and stripped of internal noise.
 
     Args:
         message: The user's task or request.
@@ -1798,18 +1875,21 @@ def run_multi_role_workflow(
     if not active_specialist_keys:
         return "No specialist agents are active. Please enable at least one specialist role.", ""
 
-    # Step 1: Detect output format and brevity BEFORE any LLM calls
+    # Step 1: Classify task, detect output format and brevity BEFORE any LLM calls
+    task_category = classify_task(message)
     output_format = detect_output_format(message)
     brevity = detect_brevity_requirement(message)
+    needs_evidence = task_needs_evidence(task_category) and config.require_evidence_for_factual_claims
 
-    # Initialise planner state for tracking across revisions
+    # Initialise planner state — central working memory for the entire run
     planner_state = PlannerState(
         user_request=message,
+        task_category=task_category,
         output_format=output_format,
         brevity_requirement=brevity,
         max_revisions=MAX_REVISIONS,
     )
-    planner_state.record_event("init", f"format={output_format}, brevity={brevity}")
+    planner_state.record_event("init", f"category={task_category}, format={output_format}, brevity={brevity}")
 
     state: WorkflowState = {
         "user_request": message,
@@ -1847,13 +1927,33 @@ def run_multi_role_workflow(
         "═══ MULTI-ROLE WORKFLOW STARTED ═══",
         f"Model   : {model_id}",
         f"Request : {message}",
+        f"Task category: {task_category}",
         f"Output format: {output_format}",
         f"Brevity: {brevity}",
+        f"Evidence required: {needs_evidence}",
         f"Strict mode: {config.strict_mode}",
         f"Allow persona roles: {config.allow_persona_roles}",
         f"Max specialists per task: {config.max_specialists_per_task}",
         f"Max revisions: {MAX_REVISIONS}",
     ]
+
+    # Step 2: Retrieve evidence via tool adapters (for factual/comparison/analysis tasks)
+    evidence: Optional[EvidenceResult] = None
+    if needs_evidence:
+        try:
+            adapters = _build_research_adapters()
+            queries = extract_search_queries(message)
+            evidence = gather_evidence(queries, adapters)
+            planner_state.evidence = evidence.to_dict()
+            trace.append(
+                f"\n[EVIDENCE RETRIEVAL] {len(evidence.results)} items retrieved "
+                f"(confidence: {evidence.confidence}) for queries: {queries}"
+            )
+            planner_state.record_event("evidence", f"items={len(evidence.results)}, confidence={evidence.confidence}")
+        except Exception as exc:
+            trace.append(f"\n[EVIDENCE RETRIEVAL] Tool error: {exc} — proceeding without evidence")
+            evidence = EvidenceResult(query=message)
+            planner_state.record_event("evidence_error", str(exc))
 
     try:
         if planner_active:
@@ -1865,9 +1965,11 @@ def run_multi_role_workflow(
                 f"\n[Planner disabled] Auto-routing to: {state['current_role'].upper()}"
             )
 
-        # Step 2: Select only RELEVANT roles instead of running all active specialists
+        # Step 3: Dynamic, task-aware role selection
         if config.strict_mode:
-            selected_roles = select_relevant_roles(message, active_specialist_keys, config)
+            selected_roles = select_relevant_roles(
+                message, active_specialist_keys, config, task_category=task_category
+            )
         else:
             selected_roles = active_specialist_keys
 
@@ -1876,8 +1978,14 @@ def run_multi_role_workflow(
         if primary_role in active_specialist_keys and primary_role not in selected_roles:
             selected_roles.insert(0, primary_role)
 
-        # Enforce max_specialists_per_task
-        selected_roles = selected_roles[:config.max_specialists_per_task]
+        # Enforce max_specialists_per_task (but don't drop auto-included research)
+        if len(selected_roles) > config.max_specialists_per_task:
+            # Keep research if it was auto-included for a factual task
+            if needs_evidence and "research" in selected_roles:
+                non_research = [r for r in selected_roles if r != "research"]
+                selected_roles = non_research[:config.max_specialists_per_task - 1] + ["research"]
+            else:
+                selected_roles = selected_roles[:config.max_specialists_per_task]
 
         planner_state.selected_roles = selected_roles
         trace.append(
@@ -1887,36 +1995,41 @@ def run_multi_role_workflow(
 
         # Main orchestration loop
         while True:
-            # Step 3: Run selected specialists
+            # Step 4: Run selected specialists
             if primary_role not in selected_roles:
                 primary_role = selected_roles[0]
                 state["current_role"] = primary_role
 
+            # Run primary specialist (research gets evidence injected)
             primary_fn = _SPECIALIST_STEPS.get(primary_role, _step_technical)
-            state = primary_fn(chat_model, state, trace)
+            if primary_role == "research" and evidence:
+                state = _step_research(chat_model, state, trace, evidence=evidence)
+            else:
+                state = primary_fn(chat_model, state, trace)
             primary_output = state["draft_output"]
+            planner_state.specialist_outputs[primary_role] = primary_output[:500]
 
             all_outputs: List[Tuple[str, str]] = [(primary_role, primary_output)]
             for specialist_role in selected_roles:
                 if specialist_role == primary_role:
                     continue
-                step_fn = _SPECIALIST_STEPS[specialist_role]
-                state = step_fn(chat_model, state, trace)
-                all_outputs.append((specialist_role, state["draft_output"]))
+                if specialist_role == "research" and evidence:
+                    state = _step_research(chat_model, state, trace, evidence=evidence)
+                else:
+                    step_fn = _SPECIALIST_STEPS[specialist_role]
+                    state = step_fn(chat_model, state, trace)
+                output = state["draft_output"]
+                all_outputs.append((specialist_role, output))
+                planner_state.specialist_outputs[specialist_role] = output[:500]
 
-            # Step 4: Synthesize — format-aware
-            if len(all_outputs) > 1:
-                trace.append(
-                    f"\n[PERSPECTIVES COLLECTED] {len(all_outputs)} specialist(s) — synthesizing..."
-                )
-                state = _step_synthesize(chat_model, state, trace, all_outputs)
-            else:
-                # Single specialist — still run through synthesizer for format compliance
-                state = _step_synthesize(chat_model, state, trace, all_outputs)
+            # Step 5: Synthesize — format-aware, evidence-grounded
+            state = _step_synthesize(chat_model, state, trace, all_outputs,
+                                     evidence=evidence)
 
-            # Step 5: QA validation
+            # Step 6: QA validation (with evidence context)
             if qa_active:
-                state = _step_qa(chat_model, state, trace, all_outputs)
+                state = _step_qa(chat_model, state, trace, all_outputs,
+                                 evidence=evidence)
             else:
                 state["qa_passed"] = True
                 state["qa_report"] = "QA Tester is disabled — skipping quality review."
@@ -1929,12 +2042,17 @@ def run_multi_role_workflow(
             planner_state.qa_result = qa_result
             planner_state.record_event("qa", f"status={qa_result.status}")
 
-            # Step 6: QA-BINDING planner review
+            # Record failures into planner state for escalation tracking
+            if not qa_result.passed:
+                planner_state.record_failure(qa_result)
+
+            # Step 7: QA-BINDING planner review
             if planner_active and qa_active:
                 is_final_revision = (state["revision_count"] + 1 >= MAX_REVISIONS) and not state["qa_passed"]
                 state = _step_planner_review(chat_model, state, trace, is_final_revision=is_final_revision)
 
                 if state["final_answer"]:
+                    planner_state.final_answer = state["final_answer"]
                     trace.append("\n═══ WORKFLOW COMPLETE — APPROVED ═══")
                     break
 
@@ -1950,10 +2068,39 @@ def run_multi_role_workflow(
                     state = _step_planner_review(chat_model, state, trace, is_final_revision=True)
                     if not state["final_answer"]:
                         state["final_answer"] = state["draft_output"]
+                    planner_state.final_answer = state["final_answer"]
                     trace.append("\n═══ WORKFLOW COMPLETE — MAX REVISIONS ═══")
                     break
 
-                # Step 7: TARGETED REVISIONS — only rerun failing role(s)
+                # Step 8: ESCALATION — check for repeated failures
+                escalation = planner_state.get_escalation_strategy()
+                if escalation != "none":
+                    trace.append(f"\n[ESCALATION] Strategy: {escalation}")
+                    planner_state.record_event("escalation", escalation)
+
+                    if escalation == "suppress_role":
+                        # Suppress roles that keep producing unsupported content
+                        suppress = planner_state.get_roles_to_suppress()
+                        for role_label in suppress:
+                            role_key = _ROLE_LABEL_TO_KEY.get(role_label)
+                            if role_key and role_key in selected_roles:
+                                selected_roles.remove(role_key)
+                                trace.append(f"  ⚠ Suppressed role: {role_label} (repeated failures)")
+                        if not selected_roles:
+                            selected_roles = [primary_role]
+
+                    elif escalation == "rewrite_from_state":
+                        # Synthesizer should rewrite from state, not reuse bloated draft
+                        trace.append("  ⚠ Synthesizer will rewrite from state instead of reusing draft")
+                        state["draft_output"] = ""  # Force synthesizer to rebuild
+
+                    elif escalation == "narrow_scope":
+                        # Reduce to a single specialist
+                        if len(selected_roles) > 1:
+                            selected_roles = [selected_roles[0]]
+                            trace.append(f"  ⚠ Narrowed to single specialist: {selected_roles[0]}")
+
+                # Step 9: TARGETED REVISIONS — only rerun failing role(s)
                 revision_targets = identify_revision_targets(qa_result, _ROLE_LABEL_TO_KEY)
                 trace.append(
                     f"\n═══ REVISION {state['revision_count']} / {MAX_REVISIONS} ═══\n"
@@ -1972,9 +2119,13 @@ def run_multi_role_workflow(
                     # Only rerun the targeted specialists
                     new_outputs = []
                     for rk in rerun_specialists:
-                        step_fn = _SPECIALIST_STEPS[rk]
-                        state = step_fn(chat_model, state, trace)
+                        if rk == "research" and evidence:
+                            state = _step_research(chat_model, state, trace, evidence=evidence)
+                        else:
+                            step_fn = _SPECIALIST_STEPS[rk]
+                            state = step_fn(chat_model, state, trace)
                         new_outputs.append((rk, state["draft_output"]))
+                        planner_state.specialist_outputs[rk] = state["draft_output"][:500]
 
                     # Merge with previous outputs (replace updated roles)
                     updated_keys = {rk for rk, _ in new_outputs}
@@ -1984,7 +2135,8 @@ def run_multi_role_workflow(
                     all_outputs = merged_outputs
 
                 if rerun_synthesizer or rerun_specialists:
-                    state = _step_synthesize(chat_model, state, trace, all_outputs)
+                    state = _step_synthesize(chat_model, state, trace, all_outputs,
+                                             evidence=evidence)
 
                 # Update selected_roles based on planner's new routing
                 primary_role = state["current_role"]
@@ -1999,6 +2151,7 @@ def run_multi_role_workflow(
             else:
                 # No Planner review loop — accept the draft
                 state["final_answer"] = state["draft_output"]
+                planner_state.final_answer = state["final_answer"]
                 trace.append("\n═══ WORKFLOW COMPLETE ═══")
                 break
 
@@ -2006,7 +2159,7 @@ def run_multi_role_workflow(
         trace.append(f"\n[ERROR] {exc}\n{traceback.format_exc()}")
         state["final_answer"] = state["draft_output"] or f"Workflow error: {exc}"
 
-    # Step 8: FINAL ANSWER COMPRESSION — strip noise, enforce format
+    # Step 10: FINAL ANSWER COMPRESSION — strip noise, enforce format
     raw_answer = state["final_answer"]
     final_answer = compress_final_answer(raw_answer, output_format, brevity, message)
     final_answer = strip_internal_noise(final_answer)
@@ -2299,6 +2452,12 @@ with gr.Blocks(title="LLM + Agent tools demo", theme=gr.themes.Soft()) as demo:
                             minimum=1, maximum=8, step=1, value=3,
                             label="Max specialists per task"
                         )
+                        require_evidence_toggle = gr.Checkbox(
+                            value=True, label="Require evidence for factual claims"
+                        )
+                        auto_research_toggle = gr.Checkbox(
+                            value=True, label="Auto-include Research for factual tasks"
+                        )
 
             with gr.Row():
                 with gr.Column(scale=2):
@@ -2317,6 +2476,7 @@ with gr.Blocks(title="LLM + Agent tools demo", theme=gr.themes.Soft()) as demo:
             def _run_workflow_ui(
                 message: str, model_id: str, role_labels: List[str],
                 strict_mode: bool, allow_persona: bool, max_specialists: int,
+                require_evidence: bool, auto_research: bool,
             ) -> Tuple[str, str]:
                 """Gradio handler: validate input, run the workflow, return outputs."""
                 if not message or not message.strip():
@@ -2326,6 +2486,8 @@ with gr.Blocks(title="LLM + Agent tools demo", theme=gr.themes.Soft()) as demo:
                         strict_mode=strict_mode,
                         allow_persona_roles=allow_persona,
                         max_specialists_per_task=int(max_specialists),
+                        require_evidence_for_factual_claims=require_evidence,
+                        always_include_research_for_factual_tasks=auto_research,
                     )
                     final_answer, trace = run_multi_role_workflow(
                         message.strip(), model_id, role_labels, config=config
@@ -2337,7 +2499,8 @@ with gr.Blocks(title="LLM + Agent tools demo", theme=gr.themes.Soft()) as demo:
             wf_submit_btn.click(
                 fn=_run_workflow_ui,
                 inputs=[wf_input, wf_model_dropdown, active_agents,
-                        strict_mode_toggle, allow_persona_toggle, max_specialists_slider],
+                        strict_mode_toggle, allow_persona_toggle, max_specialists_slider,
+                        require_evidence_toggle, auto_research_toggle],
                 outputs=[wf_answer, wf_trace],
                 show_api=False,
             )
@@ -2345,7 +2508,8 @@ with gr.Blocks(title="LLM + Agent tools demo", theme=gr.themes.Soft()) as demo:
             wf_input.submit(
                 fn=_run_workflow_ui,
                 inputs=[wf_input, wf_model_dropdown, active_agents,
-                        strict_mode_toggle, allow_persona_toggle, max_specialists_slider],
+                        strict_mode_toggle, allow_persona_toggle, max_specialists_slider,
+                        require_evidence_toggle, auto_research_toggle],
                 outputs=[wf_answer, wf_trace],
                 show_api=False,
             )

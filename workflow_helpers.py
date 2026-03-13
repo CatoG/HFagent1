@@ -14,7 +14,7 @@ Contains:
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 # ============================================================
@@ -27,6 +27,9 @@ class WorkflowConfig:
     allow_persona_roles: bool = False
     max_specialists_per_task: int = 3
     strict_mode: bool = True
+    always_include_qa: bool = True
+    always_include_research_for_factual_tasks: bool = True
+    require_evidence_for_factual_claims: bool = True
 
     # Internal: which role keys are persona/gimmick roles
     PERSONA_ROLE_KEYS: tuple = (
@@ -43,6 +46,92 @@ class WorkflowConfig:
 
 
 DEFAULT_CONFIG = WorkflowConfig()
+
+
+# ============================================================
+# Task Classification
+# ============================================================
+
+TASK_CATEGORIES = [
+    "factual_question",
+    "comparison",
+    "coding_task",
+    "creative_writing",
+    "opinion_discussion",
+    "summarization",
+    "analysis",
+    "planning",
+]
+
+_TASK_CATEGORY_PATTERNS = [
+    ("coding_task", [
+        r"\bwrite\s+(python|code|javascript|typescript|rust|java|c\+\+|go|bash|sql)\b",
+        r"\bcode\s+(to|for|that)\b", r"\bimplement\b",
+        r"\bscript\s+(to|for|that)\b", r"\bparse\s+a?\s*\w+\s+(file|data)\b",
+        r"\bdebug\b", r"\brefactor\b", r"\bfix\s+(the|this|my)\s+(code|bug)\b",
+    ]),
+    ("creative_writing", [
+        r"\bwrite\s+a\b.*\b(poem|story|essay|blog|article|song|haiku)\b",
+        r"\bcreative\s+writing\b", r"\bbrainstorm\b", r"\bimagine\b",
+        r"\bfiction\b", r"\bnarrative\b",
+    ]),
+    ("factual_question", [
+        r"\bwhat\s+(is|are|was|were)\b", r"\bwho\s+(is|was|are|were)\b",
+        r"\bwhen\s+(did|was|is)\b", r"\bwhere\s+(is|was|are)\b",
+        r"\bhow\s+many\b", r"\bhow\s+much\b",
+        r"\bnews\b", r"\brecent\b", r"\blatest\b", r"\bcurrent\b",
+        r"\bfact\b", r"\btrue\s+or\s+false\b",
+    ]),
+    ("comparison", [
+        r"\bcompar(e|ison|ing)\b", r"\bvs\.?\b", r"\bversus\b",
+        r"\bdifference\s+between\b", r"\bbetter\s+than\b",
+        r"\bwhich\s+is\s+(better|faster|cheaper)\b",
+        r"\bpros?\s+and\s+cons?\b", r"\btrade[\s-]?offs?\b",
+    ]),
+    ("summarization", [
+        r"\bsummar(y|ize|ise)\b", r"\btl;?dr\b", r"\bsynopsis\b",
+        r"\boverview\b", r"\brecap\b",
+    ]),
+    ("analysis", [
+        r"\banaly(sis|se|ze)\b", r"\bevaluat(e|ion)\b",
+        r"\bassess(ment)?\b", r"\breview\b",
+        r"\bexamin(e|ation)\b", r"\binvestigat(e|ion)\b",
+    ]),
+    ("planning", [
+        r"\bplan\b", r"\bstrateg(y|ic)\b", r"\broadmap\b",
+        r"\baction\s+items?\b", r"\bsteps?\s+to\b",
+    ]),
+    ("opinion_discussion", [
+        r"\bdiscuss\b", r"\bopinion\b", r"\bperspective\b",
+        r"\bpoint\s+of\s+view\b", r"\bargue\b", r"\bdebate\b",
+        r"\brole\s+of\b",
+    ]),
+]
+
+
+def classify_task(user_request: str) -> str:
+    """Classify the user's request into a task category.
+
+    Returns one of: factual_question, comparison, coding_task, creative_writing,
+    opinion_discussion, summarization, analysis, planning, other.
+    """
+    lower = user_request.lower()
+    best_category = "other"
+    best_score = 0
+    for category, patterns in _TASK_CATEGORY_PATTERNS:
+        score = 0
+        for pat in patterns:
+            if re.search(pat, lower):
+                score += 1
+        if score > best_score:
+            best_score = score
+            best_category = category
+    return best_category
+
+
+def task_needs_evidence(task_category: str) -> bool:
+    """Whether this task category benefits from tool-backed evidence retrieval."""
+    return task_category in ("factual_question", "comparison", "analysis", "summarization")
 
 
 # ============================================================
@@ -272,6 +361,8 @@ ROLE_RELEVANCE: Dict[str, Dict[str, Any]] = {
                       "framing", "wording", "concept", "design", "brand"],
         "domains": ["marketing", "content", "writing", "communication"],
         "description": "Ideas, framing, wording, brainstorming",
+        "role_type": "creative",
+        "task_types": ["creative_writing", "opinion_discussion"],
     },
     "technical": {
         "keywords": ["code", "implement", "build", "architecture", "api", "database",
@@ -280,6 +371,8 @@ ROLE_RELEVANCE: Dict[str, Dict[str, Any]] = {
                       "framework", "library", "performance", "faster"],
         "domains": ["engineering", "development", "devops", "infrastructure"],
         "description": "Code, architecture, implementation, technical solutions",
+        "role_type": "factual",
+        "task_types": ["coding_task", "analysis"],
     },
     "research": {
         "keywords": ["research", "study", "evidence", "literature", "paper", "facts",
@@ -287,84 +380,112 @@ ROLE_RELEVANCE: Dict[str, Dict[str, Any]] = {
                       "science", "scientific", "information"],
         "domains": ["academia", "science", "fact-finding"],
         "description": "Information gathering, literature review, fact-finding",
+        "role_type": "factual",
+        "task_types": ["factual_question", "comparison", "analysis", "summarization"],
     },
     "security": {
         "keywords": ["security", "vulnerability", "attack", "encryption", "auth",
                       "password", "exploit", "firewall", "compliance", "gdpr", "privacy"],
         "domains": ["cybersecurity", "infosec", "compliance"],
         "description": "Security analysis, vulnerability checks, best practices",
+        "role_type": "safety",
+        "task_types": ["analysis"],
     },
     "data_analyst": {
         "keywords": ["data", "analytics", "statistics", "pattern", "trend", "metric",
                       "dashboard", "visualization", "dataset", "csv", "spreadsheet"],
         "domains": ["analytics", "business intelligence"],
         "description": "Data analysis, statistics, pattern recognition, insights",
+        "role_type": "analytical",
+        "task_types": ["analysis", "comparison", "factual_question"],
     },
     "labour_union_rep": {
         "keywords": ["worker", "wages", "union", "labor", "labour", "employment",
                       "rights", "workplace", "collective", "bargaining", "fair"],
         "domains": ["labor relations", "HR", "workplace policy"],
         "description": "Worker rights, fair wages, job security",
+        "role_type": "analytical",
+        "task_types": ["opinion_discussion", "analysis"],
     },
     "ux_designer": {
         "keywords": ["user", "usability", "accessibility", "interface", "ux", "ui",
                       "design", "wireframe", "prototype", "user experience", "user-friendly"],
         "domains": ["design", "product", "UX"],
         "description": "User needs, usability, accessibility",
+        "role_type": "analytical",
+        "task_types": ["analysis", "planning"],
     },
     "lawyer": {
         "keywords": ["legal", "law", "contract", "liability", "compliance", "regulation",
                       "patent", "copyright", "trademark", "lawsuit", "litigation"],
         "domains": ["law", "compliance", "governance"],
         "description": "Legal compliance, liability, contracts, risk management",
+        "role_type": "analytical",
+        "task_types": ["analysis"],
     },
     # Persona roles — only active when allow_persona_roles is True
     "mad_professor": {
         "keywords": ["crazy", "radical", "hypothesis", "experiment", "breakthrough"],
         "domains": ["speculation"],
         "description": "Radical scientific hypotheses, extreme speculation",
+        "role_type": "persona",
+        "task_types": [],
         "is_persona": True,
     },
     "accountant": {
         "keywords": ["cost", "budget", "expense", "cheap", "price", "financial"],
         "domains": ["finance"],
         "description": "Cost scrutiny, budget optimization",
+        "role_type": "persona",
+        "task_types": [],
         "is_persona": True,
     },
     "artist": {
         "keywords": ["art", "inspiration", "vision", "aesthetic", "beauty"],
         "domains": ["art"],
         "description": "Unhinged creative vision, cosmic vibes",
+        "role_type": "persona",
+        "task_types": ["creative_writing"],
         "is_persona": True,
     },
     "lazy_slacker": {
         "keywords": ["lazy", "shortcut", "easy", "simple", "quick"],
         "domains": [],
         "description": "Minimum viable effort, shortcuts",
+        "role_type": "persona",
+        "task_types": [],
         "is_persona": True,
     },
     "black_metal_fundamentalist": {
         "keywords": ["metal", "kvlt", "underground", "nihilism"],
         "domains": [],
         "description": "Nihilistic kvlt critique",
+        "role_type": "persona",
+        "task_types": [],
         "is_persona": True,
     },
     "doris": {
         "keywords": [],
         "domains": [],
         "description": "Well-meaning but clueless observations",
+        "role_type": "persona",
+        "task_types": [],
         "is_persona": True,
     },
     "chairman_of_board": {
         "keywords": ["shareholder", "board", "governance", "strategic", "corporate"],
         "domains": ["corporate governance"],
         "description": "Corporate governance, shareholder value",
+        "role_type": "persona",
+        "task_types": [],
         "is_persona": True,
     },
     "maga_appointee": {
         "keywords": ["america", "patriot", "deregulation"],
         "domains": [],
         "description": "America First perspective",
+        "role_type": "persona",
+        "task_types": [],
         "is_persona": True,
     },
 }
@@ -374,14 +495,19 @@ def select_relevant_roles(
     user_request: str,
     active_role_keys: List[str],
     config: WorkflowConfig,
+    task_category: str = "other",
 ) -> List[str]:
     """Select only the most relevant specialist roles for a given request.
 
-    Scores each active role by keyword match frequency, filters persona roles
-    based on config, and returns at most config.max_specialists_per_task roles.
+    Scores each active role by keyword match frequency and task-category affinity,
+    filters persona roles based on config, and returns at most
+    config.max_specialists_per_task roles.
+
+    If config.always_include_research_for_factual_tasks is True and the task
+    is factual, the research role is always included.
     """
     lower = user_request.lower()
-    scored: List[tuple] = []  # (score, role_key)
+    scored: List[Tuple[int, str]] = []
 
     for role_key in active_role_keys:
         meta = ROLE_RELEVANCE.get(role_key)
@@ -396,6 +522,11 @@ def select_relevant_roles(
         for kw in meta.get("keywords", []):
             if kw.lower() in lower:
                 score += 1
+
+        # Task-category affinity bonus
+        role_tasks = meta.get("task_types", [])
+        if task_category in role_tasks:
+            score += 2
 
         scored.append((score, role_key))
 
@@ -423,6 +554,13 @@ def select_relevant_roles(
             if not meta.get("is_persona"):
                 selected.append(rk)
                 break
+
+    # Auto-include research for factual tasks
+    if (config.always_include_research_for_factual_tasks
+            and task_needs_evidence(task_category)
+            and "research" in active_role_keys
+            and "research" not in selected):
+        selected.append("research")
 
     return selected
 
@@ -579,26 +717,111 @@ def compress_final_answer(
 # ============================================================
 
 @dataclass
+class FailureRecord:
+    """Record of a single failure in the workflow."""
+    revision: int
+    owner: str          # role key or "synthesizer"
+    issue_type: str     # from QAIssue.type
+    message: str
+    correction: str
+
+    def to_dict(self) -> dict:
+        return {
+            "revision": self.revision,
+            "owner": self.owner,
+            "issue_type": self.issue_type,
+            "message": self.message,
+            "correction": self.correction,
+        }
+
+
+@dataclass
 class PlannerState:
-    """Persistent state object that tracks the planner's decisions through revisions."""
+    """Persistent state object that tracks the planner's decisions through revisions.
+
+    This is the central working memory for the workflow.
+    All stages read from and write to this shared state.
+    """
     user_request: str = ""
     task_summary: str = ""
+    task_category: str = "other"
     success_criteria: List[str] = field(default_factory=list)
     output_format: str = "other"
     brevity_requirement: str = "normal"
     selected_roles: List[str] = field(default_factory=list)
-    revision_count: int = 0
-    max_revisions: int = 3
+    specialist_outputs: Dict[str, str] = field(default_factory=dict)
+    evidence: Optional[Dict] = None  # serialised EvidenceResult
     current_draft: str = ""
     qa_result: Optional[QAResult] = None
+    revision_count: int = 0
+    max_revisions: int = 3
+    failure_history: List[FailureRecord] = field(default_factory=list)
     history: List[Dict[str, str]] = field(default_factory=list)
+    final_answer: str = ""
 
     def record_event(self, event_type: str, detail: str):
         self.history.append({"type": event_type, "detail": detail[:500]})
 
+    def record_failure(self, qa_result: QAResult):
+        """Record QA failures into the failure history."""
+        for issue in qa_result.issues:
+            self.failure_history.append(FailureRecord(
+                revision=self.revision_count,
+                owner=issue.owner,
+                issue_type=issue.type,
+                message=issue.message[:200],
+                correction=qa_result.correction_instruction[:200],
+            ))
+
+    def has_repeated_failure(self, owner: str, issue_type: str) -> bool:
+        """Check if the same owner+issue_type has failed in a previous revision."""
+        past = [
+            f for f in self.failure_history
+            if f.owner == owner and f.issue_type == issue_type
+               and f.revision < self.revision_count
+        ]
+        return len(past) >= 1
+
+    def get_repeat_failures(self) -> List[Tuple[str, str]]:
+        """Return (owner, issue_type) pairs that have failed more than once."""
+        counts: Dict[Tuple[str, str], int] = {}
+        for f in self.failure_history:
+            key = (f.owner, f.issue_type)
+            counts[key] = counts.get(key, 0) + 1
+        return [k for k, v in counts.items() if v >= 2]
+
+    def get_escalation_strategy(self) -> str:
+        """Determine escalation strategy when failures repeat.
+
+        Returns:
+            'narrow_scope' — reduce role count and simplify
+            'rewrite_from_state' — synthesizer should rewrite from state, not reuse draft
+            'suppress_role' — a specific role keeps introducing unsupported content
+            'none' — no escalation needed
+        """
+        repeats = self.get_repeat_failures()
+        if not repeats:
+            return "none"
+
+        synth_repeats = [(o, t) for o, t in repeats if o.lower() in ("synthesizer", "synthesis")]
+        role_repeats = [(o, t) for o, t in repeats if o.lower() not in ("synthesizer", "synthesis", "planner")]
+
+        if synth_repeats:
+            return "rewrite_from_state"
+        if role_repeats:
+            return "suppress_role"
+        return "narrow_scope"
+
+    def get_roles_to_suppress(self) -> List[str]:
+        """Return role owners that keep introducing repeated failures."""
+        repeats = self.get_repeat_failures()
+        return list({owner for owner, _ in repeats
+                     if owner.lower() not in ("synthesizer", "synthesis", "planner")})
+
     def to_context_string(self) -> str:
-        """Produce a summary string for inclusion in LLM prompts."""
+        """Produce a compact summary string for inclusion in LLM prompts."""
         lines = [
+            f"Task category: {self.task_category}",
             f"Output format required: {self.output_format}",
             f"Brevity requirement: {self.brevity_requirement}",
             f"Revision: {self.revision_count}/{self.max_revisions}",
@@ -606,11 +829,39 @@ class PlannerState:
         ]
         if self.success_criteria:
             lines.append(f"Success criteria: {'; '.join(self.success_criteria)}")
+        if self.evidence:
+            conf = self.evidence.get("confidence", "unknown")
+            n_items = len(self.evidence.get("results", []))
+            lines.append(f"Evidence: {n_items} items (confidence: {conf})")
         if self.qa_result and not self.qa_result.passed:
             lines.append(f"QA status: FAIL — {self.qa_result.reason}")
             if self.qa_result.correction_instruction:
                 lines.append(f"Correction needed: {self.qa_result.correction_instruction}")
+        if self.failure_history:
+            lines.append(f"Previous failures: {len(self.failure_history)}")
+            strategy = self.get_escalation_strategy()
+            if strategy != "none":
+                lines.append(f"Escalation strategy: {strategy}")
         return "\n".join(lines)
+
+    def to_state_dict(self) -> dict:
+        """Serialise the full state to a dictionary."""
+        return {
+            "user_request": self.user_request,
+            "task_summary": self.task_summary,
+            "task_category": self.task_category,
+            "success_criteria": self.success_criteria,
+            "output_format": self.output_format,
+            "brevity_requirement": self.brevity_requirement,
+            "selected_roles": self.selected_roles,
+            "specialist_outputs": self.specialist_outputs,
+            "evidence": self.evidence,
+            "current_draft": self.current_draft[:500],
+            "revision_count": self.revision_count,
+            "max_revisions": self.max_revisions,
+            "failure_history": [f.to_dict() for f in self.failure_history],
+            "final_answer": self.final_answer[:500] if self.final_answer else "",
+        }
 
 
 # ============================================================
