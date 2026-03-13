@@ -15,3 +15,6 @@ A simple LangChain + Hugging Face + Gradio app for:
 - basic math tools
 - Wikipedia lookup
 - tool trace display
+
+
+Triggered redeploy on 2026-03-13.
