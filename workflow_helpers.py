@@ -1056,3 +1056,306 @@ def format_assumptions_for_prompt(assumptions: Dict[str, str]) -> str:
     for key, value in assumptions.items():
         lines.append(f"  - {key}: {value}")
     return "\n".join(lines)
+
+
+# ============================================================
+# Structured Expert Contributions
+# ============================================================
+
+# Suffix appended to every specialist system prompt to require JSON output
+STRUCTURED_OUTPUT_SUFFIX = """
+
+IMPORTANT — OUTPUT FORMAT:
+After your analysis above, you MUST also output a JSON block at the end of your response,
+wrapped in ```json ... ``` fences, with this exact structure:
+```json
+{
+  "role": "<your role name>",
+  "main_points": ["point 1", "point 2"],
+  "recommendations": ["recommendation 1"],
+  "evidence": ["supporting evidence or examples"],
+  "assumptions": ["assumption 1"],
+  "confidence": "high | medium | low"
+}
+```
+- "main_points": your key substantive contributions to the answer (2-4 points)
+- "recommendations": specific actionable recommendations (0-3)
+- "evidence": facts, data, or examples that support your points (0-3)
+- "assumptions": assumptions you relied on (0-2)
+- "confidence": how confident you are in your contribution
+
+This JSON block is REQUIRED. The Synthesizer will use it to build the final answer.
+Do NOT write a complete final answer — focus on your domain-specific contribution.
+"""
+
+
+@dataclass
+class StructuredContribution:
+    """Structured output from an expert specialist."""
+    role: str
+    main_points: List[str] = field(default_factory=list)
+    recommendations: List[str] = field(default_factory=list)
+    evidence: List[str] = field(default_factory=list)
+    assumptions: List[str] = field(default_factory=list)
+    confidence: str = "medium"
+    raw_output: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "role": self.role,
+            "main_points": self.main_points,
+            "recommendations": self.recommendations,
+            "evidence": self.evidence,
+            "assumptions": self.assumptions,
+            "confidence": self.confidence,
+        }
+
+    def has_substance(self) -> bool:
+        """Check if this contribution has at least one substantive point."""
+        return bool(self.main_points or self.recommendations)
+
+
+def parse_structured_contribution(text: str, role: str) -> StructuredContribution:
+    """Parse a StructuredContribution from specialist LLM output.
+
+    Tries to extract a JSON block from the text. Falls back to heuristic
+    extraction from section headers if JSON is missing or malformed.
+    """
+    contribution = StructuredContribution(role=role, raw_output=text)
+
+    # Try JSON extraction first — look for ```json ... ``` block
+    json_match = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if not json_match:
+        # Also try bare JSON object
+        json_match = re.search(r'(\{\s*"role"\s*:.*\})', text, re.DOTALL)
+
+    if json_match:
+        try:
+            data = json.loads(json_match.group(1))
+            contribution.main_points = data.get("main_points", [])
+            contribution.recommendations = data.get("recommendations", [])
+            contribution.evidence = data.get("evidence", [])
+            contribution.assumptions = data.get("assumptions", [])
+            contribution.confidence = data.get("confidence", "medium")
+            if data.get("role"):
+                contribution.role = data["role"]
+            return contribution
+        except (json.JSONDecodeError, AttributeError):
+            pass
+
+    # Fallback: heuristic extraction from section-based output
+    _extract_section_points(text, contribution)
+    return contribution
+
+
+def _extract_section_points(text: str, contribution: StructuredContribution):
+    """Heuristic fallback: extract key points from section-based specialist output."""
+    lines = text.strip().splitlines()
+    current_section = ""
+    buffer: List[str] = []
+
+    # Map known section headers to contribution fields
+    section_map = {
+        # Core roles
+        "ideas": "main_points", "rationale": "main_points",
+        "technical approach": "main_points", "implementation notes": "recommendations",
+        "evidence summary": "evidence", "key findings": "evidence",
+        "security analysis": "main_points", "vulnerabilities found": "main_points",
+        "recommendations": "recommendations",
+        "data overview": "main_points", "analysis": "main_points",
+        "insights": "recommendations",
+        # Persona roles
+        "wild hypothesis": "main_points", "scientific rationale": "evidence",
+        "groundbreaking implications": "main_points",
+        "cost analysis": "main_points", "cost-cutting measures": "recommendations",
+        "cosmic vision": "main_points", "wild storm of ideas": "main_points",
+        "minimum viable effort": "main_points",
+        "kvlt verdict": "main_points", "the grim truth": "main_points",
+        "worker impact": "main_points", "union concerns": "main_points",
+        "collective bargaining position": "recommendations",
+        "user needs analysis": "main_points", "pain points": "main_points",
+        "ux recommendations": "recommendations",
+        "what doris thinks is happening": "main_points",
+        "doris's thoughts": "main_points",
+        "board perspective": "main_points", "strategic concerns": "main_points",
+        "shareholder value": "recommendations",
+        "america first analysis": "main_points",
+        "making it great again": "recommendations",
+        "legal analysis": "main_points", "liabilities and risks": "main_points",
+        "legal recommendations": "recommendations",
+    }
+
+    def flush_buffer():
+        if current_section and buffer:
+            field_name = section_map.get(current_section.lower().rstrip(":"), "")
+            if field_name:
+                combined = " ".join(ln.strip().lstrip("•-*0123456789.) ") for ln in buffer if ln.strip())
+                if combined:
+                    target = getattr(contribution, field_name)
+                    target.append(combined[:300])
+
+    for line in lines:
+        header_match = re.match(r"^([A-Z][A-Z\s\'']+):?\s*$", line.strip())
+        if header_match:
+            flush_buffer()
+            current_section = header_match.group(1).strip()
+            buffer = []
+        else:
+            # Skip lines that look like "RECOMMENDED DRAFT:", "FINAL TECHNICAL DRAFT:", etc.
+            if re.match(r"^[A-Z][A-Z\s]+DRAFT:?\s*$", line.strip()):
+                flush_buffer()
+                current_section = ""  # ignore draft sections
+                buffer = []
+            elif current_section:
+                buffer.append(line)
+
+    flush_buffer()
+
+
+def format_contributions_for_synthesizer(
+    contributions: Dict[str, "StructuredContribution"],
+) -> str:
+    """Format structured expert contributions for the Synthesizer prompt.
+
+    Presents each expert's key points, recommendations, and evidence
+    so the Synthesizer can build the final answer from them.
+    """
+    if not contributions:
+        return ""
+    parts = ["STRUCTURED EXPERT CONTRIBUTIONS:"]
+    for role_key, contrib in contributions.items():
+        role_label = contrib.role
+        section = [f"\n=== {role_label} (confidence: {contrib.confidence}) ==="]
+        if contrib.main_points:
+            section.append("Main points:")
+            for i, pt in enumerate(contrib.main_points):
+                section.append(f"  [{i}] {pt}")
+        if contrib.recommendations:
+            section.append("Recommendations:")
+            for i, rec in enumerate(contrib.recommendations):
+                section.append(f"  [{i}] {rec}")
+        if contrib.evidence:
+            section.append("Evidence:")
+            for ev in contrib.evidence:
+                section.append(f"  - {ev}")
+        if contrib.assumptions:
+            section.append("Assumptions:")
+            for a in contrib.assumptions:
+                section.append(f"  - {a}")
+        parts.append("\n".join(section))
+    return "\n\n".join(parts)
+
+
+def format_contributions_for_qa(
+    contributions: Dict[str, "StructuredContribution"],
+    used_contributions: Dict[str, List[str]],
+) -> str:
+    """Format contribution data for QA to verify expert influence."""
+    if not contributions:
+        return ""
+    parts = ["EXPERT CONTRIBUTION TRACEABILITY:"]
+    for role_key, contrib in contributions.items():
+        role_label = contrib.role
+        used = used_contributions.get(role_key, [])
+        section = [f"\n=== {role_label} ==="]
+        if contrib.main_points:
+            for i, pt in enumerate(contrib.main_points):
+                tag = "USED" if f"main_points[{i}]" in used else "NOT USED"
+                section.append(f"  main_points[{i}] [{tag}]: {pt}")
+        if contrib.recommendations:
+            for i, rec in enumerate(contrib.recommendations):
+                tag = "USED" if f"recommendations[{i}]" in used else "NOT USED"
+                section.append(f"  recommendations[{i}] [{tag}]: {rec}")
+        parts.append("\n".join(section))
+
+    used_count = sum(len(v) for v in used_contributions.values())
+    total_points = sum(
+        len(c.main_points) + len(c.recommendations) for c in contributions.values()
+    )
+    parts.append(f"\nSummary: {used_count}/{total_points} expert contributions marked as used.")
+    return "\n".join(parts)
+
+
+def parse_used_contributions(text: str) -> Dict[str, List[str]]:
+    """Parse the Synthesizer's USED_CONTRIBUTIONS JSON block from its output.
+
+    Returns a dict mapping role_key → list of contribution references
+    like ["main_points[0]", "recommendations[1]"].
+    """
+    # Look for ```json block containing "used_contributions"
+    json_match = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if json_match:
+        try:
+            data = json.loads(json_match.group(1))
+            if "used_contributions" in data:
+                return data["used_contributions"]
+        except (json.JSONDecodeError, AttributeError):
+            pass
+
+    # Look for a USED_CONTRIBUTIONS: section
+    if "USED_CONTRIBUTIONS:" in text:
+        section = text.split("USED_CONTRIBUTIONS:", 1)[1]
+        # Try to find JSON in the section
+        json_match = re.search(r"(\{.*?\})", section, re.DOTALL)
+        if json_match:
+            try:
+                return json.loads(json_match.group(1))
+            except (json.JSONDecodeError, AttributeError):
+                pass
+
+    return {}
+
+
+def check_expert_influence(
+    contributions: Dict[str, "StructuredContribution"],
+    used_contributions: Dict[str, List[str]],
+    final_answer: str,
+) -> List[str]:
+    """Check whether the final answer materially uses expert contributions.
+
+    Returns a list of influence issues (empty = influence is adequate).
+    """
+    issues: List[str] = []
+    if not contributions:
+        return issues
+
+    # Check 1: Are any contributions marked as used?
+    total_used = sum(len(refs) for refs in used_contributions.values())
+    total_available = sum(
+        len(c.main_points) + len(c.recommendations)
+        for c in contributions.values() if c.has_substance()
+    )
+    if total_available > 0 and total_used == 0:
+        issues.append(
+            "Final answer does not materially incorporate any specialist contributions."
+        )
+        return issues
+
+    # Check 2: For each contributing expert, is at least one point used?
+    for role_key, contrib in contributions.items():
+        if not contrib.has_substance():
+            continue
+        role_refs = used_contributions.get(role_key, [])
+        if not role_refs:
+            issues.append(
+                f"Expert '{contrib.role}' provided substantive points but none were used."
+            )
+
+    # Check 3: Do used points appear to influence the final answer?
+    # (Lightweight check: verify at least some expert vocabulary appears)
+    answer_lower = final_answer.lower()
+    expert_words_found = 0
+    for contrib in contributions.values():
+        for pt in contrib.main_points:
+            # Extract key content words (3+ chars)
+            words = [w for w in re.findall(r"\b\w{3,}\b", pt.lower())
+                     if w not in ("the", "and", "for", "that", "this", "with", "from", "are", "was")]
+            matches = sum(1 for w in words if w in answer_lower)
+            if matches >= 2:
+                expert_words_found += 1
+    if expert_words_found == 0 and total_available > 0:
+        issues.append(
+            "Final answer appears to not reflect expert contribution content."
+        )
+
+    return issues

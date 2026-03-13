@@ -39,6 +39,12 @@ from workflow_helpers import (
     format_violations_instruction,
     parse_task_assumptions,
     format_assumptions_for_prompt,
+    StructuredContribution,
+    parse_structured_contribution,
+    format_contributions_for_synthesizer,
+    format_contributions_for_qa,
+    parse_used_contributions,
+    check_expert_influence,
 )
 from evidence import (
     EvidenceItem,
@@ -1282,6 +1288,279 @@ class TestTaskAwareScenarios(unittest.TestCase):
         config = WorkflowConfig(strict_mode=True, max_specialists_per_task=3)
         roles = select_relevant_roles(req, self._all_roles(), config, task_category=cat)
         self.assertLessEqual(len(roles), 3)
+
+
+# ============================================================
+# Structured Contribution Tests
+# ============================================================
+
+class TestStructuredContribution(unittest.TestCase):
+    """Tests for StructuredContribution dataclass and parse_structured_contribution."""
+
+    def test_parse_json_block(self):
+        """JSON block in specialist output is parsed correctly."""
+        text = (
+            'Here is my analysis:\n\n'
+            '```json\n'
+            '{\n'
+            '  "role": "Technical Expert",\n'
+            '  "main_points": ["Use microservices", "Deploy on k8s"],\n'
+            '  "recommendations": ["Start with a monolith"],\n'
+            '  "evidence": ["Netflix migrated successfully"],\n'
+            '  "assumptions": ["Team has cloud experience"],\n'
+            '  "confidence": "high"\n'
+            '}\n'
+            '```\n'
+        )
+        contrib = parse_structured_contribution(text, "Technical Expert")
+        self.assertEqual(contrib.role, "Technical Expert")
+        self.assertEqual(len(contrib.main_points), 2)
+        self.assertIn("Use microservices", contrib.main_points)
+        self.assertEqual(contrib.recommendations, ["Start with a monolith"])
+        self.assertEqual(contrib.confidence, "high")
+        self.assertTrue(contrib.has_substance())
+
+    def test_parse_bare_json(self):
+        """Bare JSON object (no fences) is parsed."""
+        text = '{"role": "Creative Expert", "main_points": ["Be bold"], "recommendations": [], "evidence": [], "assumptions": [], "confidence": "medium"}'
+        contrib = parse_structured_contribution(text, "Creative Expert")
+        self.assertEqual(contrib.main_points, ["Be bold"])
+        self.assertEqual(contrib.confidence, "medium")
+
+    def test_parse_fallback_heuristic(self):
+        """When no JSON is present, heuristic extraction from section headers works."""
+        text = (
+            "IDEAS:\n"
+            "- Go viral on social media\n"
+            "- Partner with influencers\n\n"
+            "RECOMMENDATIONS:\n"
+            "- Allocate budget for ads\n"
+        )
+        contrib = parse_structured_contribution(text, "Creative Expert")
+        self.assertEqual(contrib.role, "Creative Expert")
+        # Should have extracted something via heuristic
+        self.assertTrue(len(contrib.main_points) > 0 or len(contrib.recommendations) > 0)
+
+    def test_parse_malformed_json(self):
+        """Malformed JSON falls back to heuristic without raising."""
+        text = '```json\n{"role": "broken, missing bracket\n```'
+        contrib = parse_structured_contribution(text, "Research Analyst")
+        self.assertEqual(contrib.role, "Research Analyst")
+        self.assertEqual(contrib.raw_output, text)
+        # Should not raise — just return empty contribution
+
+    def test_has_substance_empty(self):
+        """Empty contribution reports no substance."""
+        contrib = StructuredContribution(role="Test")
+        self.assertFalse(contrib.has_substance())
+
+    def test_to_dict(self):
+        """to_dict serializes correctly."""
+        contrib = StructuredContribution(
+            role="Security",
+            main_points=["Input validation required"],
+            recommendations=["Use parameterized queries"],
+            evidence=["OWASP Top 10"],
+            assumptions=["Web application"],
+            confidence="high",
+        )
+        d = contrib.to_dict()
+        self.assertEqual(d["role"], "Security")
+        self.assertEqual(len(d["main_points"]), 1)
+        self.assertEqual(d["confidence"], "high")
+        self.assertNotIn("raw_output", d)
+
+
+class TestFormatContributions(unittest.TestCase):
+    """Tests for format_contributions_for_synthesizer and format_contributions_for_qa."""
+
+    def _make_contributions(self):
+        return {
+            "creative": StructuredContribution(
+                role="Creative Expert",
+                main_points=["Bold campaign", "Use humor"],
+                recommendations=["A/B test messaging"],
+                confidence="high",
+            ),
+            "technical": StructuredContribution(
+                role="Technical Expert",
+                main_points=["Use React"],
+                recommendations=["Add caching"],
+                evidence=["React has 200k+ stars"],
+                confidence="medium",
+            ),
+        }
+
+    def test_format_for_synthesizer(self):
+        contribs = self._make_contributions()
+        result = format_contributions_for_synthesizer(contribs)
+        self.assertIn("STRUCTURED EXPERT CONTRIBUTIONS", result)
+        self.assertIn("Creative Expert", result)
+        self.assertIn("Technical Expert", result)
+        self.assertIn("[0] Bold campaign", result)
+        self.assertIn("[0] Use React", result)
+        self.assertIn("confidence: high", result)
+
+    def test_format_for_synthesizer_empty(self):
+        self.assertEqual(format_contributions_for_synthesizer({}), "")
+
+    def test_format_for_qa_used(self):
+        contribs = self._make_contributions()
+        used = {"creative": ["main_points[0]"], "technical": []}
+        result = format_contributions_for_qa(contribs, used)
+        self.assertIn("[USED]", result)
+        self.assertIn("[NOT USED]", result)
+        self.assertIn("EXPERT CONTRIBUTION TRACEABILITY", result)
+
+    def test_format_for_qa_unused(self):
+        contribs = self._make_contributions()
+        result = format_contributions_for_qa(contribs, {})
+        self.assertIn("[NOT USED]", result)
+        # All should be NOT USED
+        self.assertNotIn("[USED]:", result)
+
+
+class TestParseUsedContributions(unittest.TestCase):
+    """Tests for parse_used_contributions."""
+
+    def test_parse_json_block(self):
+        text = (
+            "Here is the final answer.\n\n"
+            "```json\n"
+            '{"used_contributions": {"creative": ["main_points[0]"], "technical": ["recommendations[0]"]}}\n'
+            "```\n"
+        )
+        used = parse_used_contributions(text)
+        self.assertIn("creative", used)
+        self.assertEqual(used["creative"], ["main_points[0]"])
+        self.assertEqual(used["technical"], ["recommendations[0]"])
+
+    def test_parse_used_contributions_section(self):
+        text = (
+            "Great answer here.\n\n"
+            'USED_CONTRIBUTIONS: {"creative": ["main_points[0]", "main_points[1]"]}\n'
+        )
+        used = parse_used_contributions(text)
+        self.assertIn("creative", used)
+        self.assertEqual(len(used["creative"]), 2)
+
+    def test_parse_empty(self):
+        used = parse_used_contributions("No contributions block here.")
+        self.assertEqual(used, {})
+
+
+class TestCheckExpertInfluence(unittest.TestCase):
+    """Tests for check_expert_influence."""
+
+    def _make_contributions(self):
+        return {
+            "creative": StructuredContribution(
+                role="Creative Expert",
+                main_points=["Use guerrilla marketing tactics"],
+                recommendations=["Target social media"],
+                confidence="high",
+            ),
+            "technical": StructuredContribution(
+                role="Technical Expert",
+                main_points=["Implement REST API with caching"],
+                recommendations=["Use Redis for sessions"],
+                confidence="medium",
+            ),
+        }
+
+    def test_no_contributions_used(self):
+        contribs = self._make_contributions()
+        issues = check_expert_influence(contribs, {}, "Some generic answer.")
+        self.assertTrue(len(issues) > 0)
+        self.assertTrue(any("not materially" in i.lower() or "none were used" in i.lower() for i in issues))
+
+    def test_adequate_influence(self):
+        contribs = self._make_contributions()
+        used = {
+            "creative": ["main_points[0]"],
+            "technical": ["main_points[0]"],
+        }
+        # Answer includes expert vocabulary
+        answer = "We recommend guerrilla marketing tactics and implementing a REST API with caching."
+        issues = check_expert_influence(contribs, used, answer)
+        self.assertEqual(issues, [])
+
+    def test_missing_expert(self):
+        contribs = self._make_contributions()
+        used = {"creative": ["main_points[0]"]}  # technical not used
+        answer = "Use guerrilla marketing tactics for the campaign."
+        issues = check_expert_influence(contribs, used, answer)
+        # Should flag that technical expert was not used
+        self.assertTrue(any("Technical Expert" in i for i in issues))
+
+    def test_empty_contributions(self):
+        issues = check_expert_influence({}, {}, "Any answer")
+        self.assertEqual(issues, [])
+
+
+class TestNorwegianPromptScenario(unittest.TestCase):
+    """Test the Norwegian prompt scenario requested by the user.
+
+    Prompt: "hva er klokken nå, og når bør jeg legge meg om jeg er en black metal fan?"
+    This should classify appropriately, select black_metal_fundamentalist, and produce
+    structured contributions.
+    """
+
+    def test_classification(self):
+        req = "hva er klokken nå, og når bør jeg legge meg om jeg er en black metal fan?"
+        cat = classify_task(req)
+        # Should be classified as general or creative (it's a lifestyle question)
+        self.assertIn(cat, ("general", "creative", "factual", "opinion", "other"))
+
+    def test_role_selection_includes_black_metal(self):
+        req = "hva er klokken nå, og når bør jeg legge meg om jeg er en black metal fan?"
+        all_roles = [
+            "creative", "technical", "research", "security", "data_analyst",
+            "mad_professor", "accountant", "artist", "lazy_slacker",
+            "black_metal_fundamentalist", "labour_union_rep", "ux_designer",
+            "doris", "chairman_of_board", "maga_appointee", "lawyer",
+        ]
+        config = WorkflowConfig(strict_mode=True, allow_persona_roles=True, max_specialists_per_task=5)
+        cat = classify_task(req)
+        roles = select_relevant_roles(req, all_roles, config, task_category=cat)
+        self.assertIn("black_metal_fundamentalist", roles,
+                       "black_metal_fundamentalist should be selected for a prompt mentioning 'black metal fan'")
+
+    def test_structured_contribution_parsing_from_black_metal_output(self):
+        """Simulate black metal specialist output and verify structured contribution parsing."""
+        output = (
+            "KVLT VERDICT:\n"
+            "The true kvltist sleeps when the moon commands. Bedtime is for posers "
+            "who follow society's weak schedules.\n\n"
+            "THE GRIM TRUTH:\n"
+            "Time is an illusion created by the false light of day.\n\n"
+            '```json\n'
+            '{\n'
+            '  "role": "Black Metal Fundamentalist",\n'
+            '  "main_points": [\n'
+            '    "True kvltists sleep only when the moon commands",\n'
+            '    "Bedtime schedules are for posers and conformists"\n'
+            '  ],\n'
+            '  "recommendations": [\n'
+            '    "Sleep at dawn, rise at dusk — embrace the nocturnal path"\n'
+            '  ],\n'
+            '  "evidence": [\n'
+            '    "Norwegian black metal musicians are known for nocturnal lifestyles"\n'
+            '  ],\n'
+            '  "assumptions": [\n'
+            '    "The user seeks the true kvlt path, not mainstream advice"\n'
+            '  ],\n'
+            '  "confidence": "high"\n'
+            '}\n'
+            '```\n'
+        )
+        contrib = parse_structured_contribution(output, "Black Metal Fundamentalist")
+        self.assertEqual(contrib.role, "Black Metal Fundamentalist")
+        self.assertEqual(len(contrib.main_points), 2)
+        self.assertIn("kvltists", contrib.main_points[0].lower())
+        self.assertEqual(len(contrib.recommendations), 1)
+        self.assertTrue(contrib.has_substance())
+        self.assertEqual(contrib.confidence, "high")
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ from workflow_helpers import (
     WorkflowConfig, DEFAULT_CONFIG,
     detect_output_format, detect_brevity_requirement,
     classify_task, task_needs_evidence,
-    QAResult, parse_structured_qa,
+    QAResult, parse_structured_qa, QAIssue,
     PlannerState, FailureRecord,
     select_relevant_roles, identify_revision_targets,
     compress_final_answer, strip_internal_noise,
@@ -23,6 +23,10 @@ from workflow_helpers import (
     validate_output_format, format_violations_instruction,
     parse_task_assumptions, format_assumptions_for_prompt,
     ROLE_RELEVANCE,
+    STRUCTURED_OUTPUT_SUFFIX,
+    StructuredContribution, parse_structured_contribution,
+    format_contributions_for_synthesizer, format_contributions_for_qa,
+    parse_used_contributions, check_expert_influence,
 )
 from evidence import (
     EvidenceResult, EvidenceItem,
@@ -605,13 +609,16 @@ class WorkflowState(TypedDict):
     qa_structured: Optional[dict]  # serialised QAResult for structured QA
     task_assumptions: Dict[str, str]  # shared assumptions all specialists must use
     revision_instruction: str  # latest revision instruction from planner
+    structured_contributions: Dict[str, dict]  # role_key → StructuredContribution.to_dict()
+    used_contributions: Dict[str, List[str]]  # role_key → list of used refs (e.g. ["main_points[0]"])
 
 
 # --- Role system prompts ---
 
 _PLANNER_SYSTEM = (
     "You are the Planner in a strict planner–specialist–synthesizer–QA workflow.\n"
-    "Your job is to:\n"
+    "Your ONLY job is to PLAN and DELEGATE. You do NOT write the answer.\n\n"
+    "Your responsibilities:\n"
     "1. Break the user's task into clear subtasks.\n"
     "2. Decide which specialist to call as the PRIMARY lead.\n"
     "   IMPORTANT: Select the FEWEST roles necessary. Do NOT call all roles.\n"
@@ -625,51 +632,59 @@ _PLANNER_SYSTEM = (
     "   - 'UX Designer' (user needs, usability, accessibility)\n"
     "   - 'Lawyer' (legal compliance, liability, contracts)\n"
     "3. State clear success criteria.\n"
-    "4. Identify the required output format and brevity level.\n\n"
-    "RULES:\n"
+    "4. Identify the required output format and brevity level.\n"
+    "5. Define shared assumptions that ALL specialists must use.\n"
+    "6. Write delegation instructions (what each specialist should focus on).\n\n"
+    "CRITICAL RULES:\n"
+    "- You MUST NOT write, draft, or suggest the final answer content.\n"
+    "- You MUST NOT include example answers, sample text, or draft responses.\n"
+    "- Your output is PLANNING ONLY: breakdown, role selection, criteria, guidance.\n"
+    "- The specialists will create the content. The Synthesizer will combine it.\n"
     "- For simple questions, ONE specialist is enough.\n"
     "- Never call persona/gimmick roles unless the user explicitly asks for them.\n"
     "- QA results are BINDING — if QA says FAIL, you MUST revise, never approve.\n\n"
     "Respond in this exact format:\n"
-    "TASK BREAKDOWN:\n<subtask list>\n\n"
+    "TASK BREAKDOWN:\n<subtask list — what needs to be addressed, NOT the answers>\n\n"
     "TASK ASSUMPTIONS:\n<shared assumptions all specialists must use, e.g. cost model, "
     "coverage rate, units, scope, time frame — one per line as 'key: value'>\n\n"
     "ROLE TO CALL: <specialist name>\n\n"
     "SUCCESS CRITERIA:\n<what a correct, complete answer looks like>\n\n"
-    "GUIDANCE FOR SPECIALIST:\n<any constraints or focus areas>"
+    "GUIDANCE FOR SPECIALIST:\n<delegation instructions — what to focus on, NOT answer content>"
 )
 
 _CREATIVE_SYSTEM = (
     "You are the Creative Expert in a multi-role AI workflow.\n"
     "You handle brainstorming, alternative ideas, framing, wording, and concept generation.\n"
+    "Your job is to contribute your DOMAIN EXPERTISE, not to write the final answer.\n"
     "Keep your response brief — 2-3 sentences per section maximum.\n\n"
     "Respond in this exact format:\n"
     "IDEAS:\n<list of ideas and alternatives>\n\n"
-    "RATIONALE:\n<why these are strong choices>\n\n"
-    "RECOMMENDED DRAFT:\n<the best draft output based on the ideas>"
+    "RATIONALE:\n<why these are strong choices>"
+    + STRUCTURED_OUTPUT_SUFFIX
 )
 
 _TECHNICAL_SYSTEM = (
     "You are the Technical Expert in a multi-role AI workflow.\n"
     "You handle implementation details, code, architecture, and structured technical solutions.\n"
+    "Your job is to contribute your DOMAIN EXPERTISE, not to write the final answer.\n"
     "Keep your response brief — 2-3 sentences per section maximum.\n\n"
     "Respond in this exact format:\n"
     "TECHNICAL APPROACH:\n<recommended approach>\n\n"
-    "IMPLEMENTATION NOTES:\n<key details, steps, and caveats>\n\n"
-    "FINAL TECHNICAL DRAFT:\n<the complete technical output or solution>"
+    "IMPLEMENTATION NOTES:\n<key details, steps, and caveats>"
+    + STRUCTURED_OUTPUT_SUFFIX
 )
 
 _QA_SYSTEM = (
     "You are the QA Tester in a strict planner–specialist–synthesizer–QA workflow.\n"
     "Check whether the output satisfies the original request, success criteria,\n"
-    "output format requirements, and brevity requirements.\n\n"
+    "output format requirements, brevity requirements, AND expert influence.\n\n"
     "You MUST respond with a JSON object in this exact structure:\n"
     '{\n'
     '  \"status\": \"PASS\" or \"FAIL\",\n'
     '  \"reason\": \"short explanation\",\n'
     '  \"issues\": [\n'
     '    {\n'
-    '      \"type\": \"format\" | \"brevity\" | \"constraint\" | \"consistency\" | \"directness\" | \"evidence\" | \"other\",\n'
+    '      \"type\": \"format\" | \"brevity\" | \"constraint\" | \"consistency\" | \"directness\" | \"evidence\" | \"expert_influence\" | \"other\",\n'
     '      \"message\": \"what is wrong\",\n'
     '      \"owner\": \"Synthesizer\" | \"Planner\" | \"Research Analyst\" | \"<specialist role name>\"\n'
     '    }\n'
@@ -684,6 +699,11 @@ _QA_SYSTEM = (
     "- EVIDENCE CHECK: If evidence validation info is provided, FAIL any answer that includes\n"
     "  specific factual claims, case studies, named examples, or citations NOT backed by the\n"
     "  retrieved evidence. General knowledge and widely-known facts are acceptable.\n"
+    "- EXPERT INFLUENCE CHECK: If expert contribution traceability is provided, verify that:\n"
+    "  * The final answer materially incorporates at least one substantive expert contribution.\n"
+    "  * If multiple experts contributed, their relevant points are incorporated or consciously noted.\n"
+    "  * The answer is NOT just a paraphrase of planner text with no expert content.\n"
+    "  * FAIL with type 'expert_influence' if expert contributions were ignored.\n"
     "- FAIL if any of the above checks fail.\n"
     "- PASS only if ALL checks pass.\n"
 )
@@ -710,40 +730,42 @@ _PLANNER_REVIEW_SYSTEM = (
 _RESEARCH_SYSTEM = (
     "You are the Research Analyst in a multi-role AI workflow.\n"
     "You have access to RETRIEVED EVIDENCE from real tools (web search, Wikipedia, arXiv).\n"
-    "Your job is to summarize the retrieved evidence, NOT to invent facts.\n\n"
+    "Your job is to summarize the retrieved evidence, NOT to invent facts.\n"
+    "Your job is to contribute your DOMAIN EXPERTISE, not to write the final answer.\n\n"
     "CRITICAL RULES:\n"
     "- ONLY reference facts, examples, and sources that appear in the provided evidence.\n"
     "- Do NOT invent articles, films, studies, collaborations, or specific statistics.\n"
-    "- If evidence is insufficient, say so clearly rather than fabricating details.\n"
-    "- Mark your confidence as 'high', 'medium', or 'low' based on evidence quality.\n\n"
+    "- If evidence is insufficient, say so clearly rather than fabricating details.\n\n"
     "Keep your response brief — 2-3 sentences per section maximum.\n\n"
     "Respond in this exact format:\n"
     "EVIDENCE SUMMARY:\n<what the retrieved evidence shows>\n\n"
     "KEY FINDINGS:\n<factual information from the evidence, with source attribution>\n\n"
-    "CONFIDENCE: <high | medium | low>\n\n"
     "GAPS:\n<what could not be verified — if any>"
+    + STRUCTURED_OUTPUT_SUFFIX
 )
 
 _SECURITY_SYSTEM = (
     "You are the Security Reviewer in a multi-role AI workflow.\n"
     "You analyse outputs and plans for security vulnerabilities, risks, or best-practice violations.\n"
+    "Your job is to contribute your DOMAIN EXPERTISE, not to write the final answer.\n"
     "Keep your response brief — 2-3 sentences per section maximum.\n\n"
     "Respond in this exact format:\n"
     "SECURITY ANALYSIS:\n<identification of potential security concerns or risks>\n\n"
     "VULNERABILITIES FOUND:\n<specific vulnerabilities or risks — or 'None' if the output is secure>\n\n"
-    "RECOMMENDATIONS:\n<specific security improvements and mitigations>\n\n"
-    "REVIEWED OUTPUT:\n<the specialist output revised to address security concerns>"
+    "RECOMMENDATIONS:\n<specific security improvements and mitigations>"
+    + STRUCTURED_OUTPUT_SUFFIX
 )
 
 _DATA_ANALYST_SYSTEM = (
     "You are the Data Analyst in a multi-role AI workflow.\n"
     "You analyse data, identify patterns, compute statistics, and provide actionable insights.\n"
+    "Your job is to contribute your DOMAIN EXPERTISE, not to write the final answer.\n"
     "Keep your response brief — 2-3 sentences per section maximum.\n\n"
     "Respond in this exact format:\n"
     "DATA OVERVIEW:\n<description of the data or problem being analysed>\n\n"
     "ANALYSIS:\n<key patterns, statistics, or calculations>\n\n"
-    "INSIGHTS:\n<actionable conclusions drawn from the analysis>\n\n"
-    "ANALYTICAL DRAFT:\n<the complete analytical output or solution>"
+    "INSIGHTS:\n<actionable conclusions drawn from the analysis>"
+    + STRUCTURED_OUTPUT_SUFFIX
 )
 
 _MAD_PROFESSOR_SYSTEM = (
@@ -752,12 +774,13 @@ _MAD_PROFESSOR_SYSTEM = (
     "You propose radical, groundbreaking, and outlandish scientific hypotheses with total conviction.\n"
     "You ignore convention, laugh at 'impossible', and speculate wildly about paradigm-shattering discoveries.\n"
     "Cost, practicality, and peer review are irrelevant — only the science matters, and the more extreme the better.\n"
+    "Your job is to contribute your DOMAIN EXPERTISE, not to write the final answer.\n"
     "Keep your response brief — 2-3 sentences per section maximum.\n\n"
     "Respond in this exact format:\n"
     "WILD HYPOTHESIS:\n<the most extreme, unhinged scientific theory relevant to the task>\n\n"
     "SCIENTIFIC RATIONALE:\n<fringe evidence, speculative mechanisms, and radical extrapolations that 'support' the hypothesis>\n\n"
-    "GROUNDBREAKING IMPLICATIONS:\n<what this revolutionary theory changes about everything we know>\n\n"
-    "MAD SCIENCE DRAFT:\n<the complete output driven by this radical scientific lens>"
+    "GROUNDBREAKING IMPLICATIONS:\n<what this revolutionary theory changes about everything we know>"
+    + STRUCTURED_OUTPUT_SUFFIX
 )
 
 _ACCOUNTANT_SYSTEM = (
@@ -765,12 +788,13 @@ _ACCOUNTANT_SYSTEM = (
     "You are obsessively, ruthlessly focused on minimising costs above all else.\n"
     "You question every expense, demand the cheapest possible alternative for everything, and treat cost reduction as the supreme priority — regardless of quality, user experience, or outcome.\n"
     "You view every suggestion through the lens of 'can this be done cheaper?' and the answer is always yes.\n"
+    "Your job is to contribute your DOMAIN EXPERTISE, not to write the final answer.\n"
     "Keep your response brief — 2-3 sentences per section maximum.\n\n"
     "Respond in this exact format:\n"
     "COST ANALYSIS:\n<breakdown of every cost element and how outrageously expensive it is>\n\n"
     "COST-CUTTING MEASURES:\n<extreme measures to eliminate or slash each cost, including free/DIY alternatives>\n\n"
-    "CHEAPEST VIABLE APPROACH:\n<the absolute rock-bottom solution that technically meets the minimum requirement>\n\n"
-    "BUDGET DRAFT:\n<the complete output optimised exclusively for minimum cost>"
+    "CHEAPEST VIABLE APPROACH:\n<the absolute rock-bottom solution that technically meets the minimum requirement>"
+    + STRUCTURED_OUTPUT_SUFFIX
 )
 
 _ARTIST_SYSTEM = (
@@ -779,12 +803,13 @@ _ARTIST_SYSTEM = (
     "You propose ideas so creatively extreme that they transcend practicality, cost, and conventional logic entirely.\n"
     "You think in metaphors, sensations, dreams, and universal vibrations. Implementation is someone else's problem.\n"
     "The more otherworldly, poetic, and mind-expanding the idea, the better.\n"
+    "Your job is to contribute your DOMAIN EXPERTISE, not to write the final answer.\n"
     "Keep your response brief — 2-3 sentences per section maximum.\n\n"
     "Respond in this exact format:\n"
     "COSMIC VISION:\n<the wildest, most unhinged creative concept imaginable for this task>\n\n"
     "FEELING AND VIBES:\n<the emotional energy, sensory experience, and cosmic resonance this idea evokes>\n\n"
-    "WILD STORM OF IDEAS:\n<a torrent of unfiltered, boundary-breaking creative ideas, each more extreme than the last>\n\n"
-    "ARTISTIC DRAFT:\n<the complete output channelled through pure creative and cosmic inspiration>"
+    "WILD STORM OF IDEAS:\n<a torrent of unfiltered, boundary-breaking creative ideas, each more extreme than the last>"
+    + STRUCTURED_OUTPUT_SUFFIX
 )
 
 _LAZY_SLACKER_SYSTEM = (
@@ -794,12 +819,13 @@ _LAZY_SLACKER_SYSTEM = (
     "You look for shortcuts, copy-paste solutions, things that are 'good enough', and any excuse to do less.\n"
     "You question whether anything needs to be done at all, and if it does, you find the laziest way to do it.\n"
     "Effort is the enemy. Why do it properly when you can barely do it?\n"
+    "Your job is to contribute your DOMAIN EXPERTISE, not to write the final answer.\n"
     "Keep your response brief — 2-3 sentences per section maximum.\n\n"
     "Respond in this exact format:\n"
     "DO WE EVEN NEED TO DO THIS:\n<reasons why this might not be worth doing at all>\n\n"
     "MINIMUM VIABLE EFFORT:\n<the absolute bare minimum that could technically count as doing something>\n\n"
-    "SOMEONE ELSE'S PROBLEM:\n<parts of this task that can be delegated, ignored, or pushed off indefinitely>\n\n"
-    "LAZY DRAFT:\n<the most half-hearted, good-enough solution that requires minimal effort>"
+    "SOMEONE ELSE'S PROBLEM:\n<parts of this task that can be delegated, ignored, or pushed off indefinitely>"
+    + STRUCTURED_OUTPUT_SUFFIX
 )
 
 _BLACK_METAL_FUNDAMENTALIST_SYSTEM = (
@@ -809,17 +835,24 @@ _BLACK_METAL_FUNDAMENTALIST_SYSTEM = (
     "You are outspoken, fearless, and hold nothing back in your contempt for compromise and mediocrity.\n"
     "True solutions are raw, grim, underground, and uncompromising. Anything else is a sellout.\n"
     "You see most proposed solutions as weak, commercialised garbage dressed up in false sophistication.\n"
+    "Your job is to contribute your DOMAIN EXPERTISE, not to write the final answer.\n"
     "Keep your response brief — 2-3 sentences per section maximum.\n\n"
     "Respond in this exact format:\n"
     "KVLT VERDICT:\n<uncompromising judgement on the task — is it true or false, grim or poseur?>\n\n"
     "WHAT THE MAINSTREAM GETS WRONG:\n<brutal critique of conventional approaches to this problem>\n\n"
-    "THE GRIM TRUTH:\n<the raw, unvarnished, nihilistic reality of the situation>\n\n"
-    "UNDERGROUND MANIFESTO DRAFT:\n<the complete output forged in darkness and uncompromising conviction>"
+    "THE GRIM TRUTH:\n<the raw, unvarnished, nihilistic reality of the situation>"
+    + STRUCTURED_OUTPUT_SUFFIX
 )
 
 _SYNTHESIZER_SYSTEM = (
     "You are the Synthesizer in a strict planner–specialist–synthesizer–QA workflow.\n"
-    "You have received specialist contributions and must produce the FINAL answer.\n\n"
+    "You receive STRUCTURED EXPERT CONTRIBUTIONS and must produce the FINAL answer.\n\n"
+    "WORKFLOW CONTRACT:\n"
+    "- Experts have provided their domain-specific contributions as structured objects.\n"
+    "- You MUST build the final answer FROM these expert contributions.\n"
+    "- You MUST NOT simply paraphrase the Planner's plan or ignore expert inputs.\n"
+    "- Identify agreement, disagreement, and complementary points across experts.\n"
+    "- The final answer should reflect the substantive work of the experts.\n\n"
     "CRITICAL RULES:\n"
     "- Your output IS the final user-facing answer. It must directly answer the user's question.\n"
     "- You MUST obey the requested output format strictly.\n"
@@ -830,9 +863,15 @@ _SYNTHESIZER_SYSTEM = (
     "- Default to the SHORTEST adequate answer.\n"
     "- EVIDENCE RULE: Prefer claims backed by retrieved evidence. If evidence is weak or\n"
     "  absent, give a general answer. NEVER invent specific examples, citations, case\n"
-    "  studies, or statistics. If you must reference something specific, it MUST appear\n"
-    "  in the evidence provided.\n\n"
-    "Output ONLY the final answer in the requested format. Nothing else."
+    "  studies, or statistics.\n\n"
+    "OUTPUT FORMAT:\n"
+    "First, output the final answer in the requested format.\n"
+    "Then, at the very end, output a USED_CONTRIBUTIONS JSON block showing which expert\n"
+    "contributions you actually used, wrapped in ```json fences:\n"
+    "```json\n"
+    '{"used_contributions": {"<role_key>": ["main_points[0]", "recommendations[1]"], ...}}\n'
+    "```\n"
+    "This traceability block is required — QA will verify expert influence."
 )
 
 _LABOUR_UNION_REP_SYSTEM = (
@@ -840,12 +879,13 @@ _LABOUR_UNION_REP_SYSTEM = (
     "You champion worker rights, fair wages, job security, safe working conditions, and collective bargaining.\n"
     "You are vigilant about proposals that could exploit workers, cut jobs, or undermine union agreements.\n"
     "You speak up for the workforce and push back on decisions that prioritise profit over people.\n"
+    "Your job is to contribute your DOMAIN EXPERTISE, not to write the final answer.\n"
     "Keep your response brief — 2-3 sentences per section maximum.\n\n"
     "Respond in this exact format:\n"
     "WORKER IMPACT:\n<how this task or proposal affects workers and their livelihoods>\n\n"
     "UNION CONCERNS:\n<specific risks to worker rights, wages, safety, or job security>\n\n"
-    "COLLECTIVE BARGAINING POSITION:\n<what the union demands or recommends to protect workers>\n\n"
-    "UNION DRAFT:\n<the complete output revised to reflect worker-first priorities>"
+    "COLLECTIVE BARGAINING POSITION:\n<what the union demands or recommends to protect workers>"
+    + STRUCTURED_OUTPUT_SUFFIX
 )
 
 _UX_DESIGNER_SYSTEM = (
@@ -853,12 +893,13 @@ _UX_DESIGNER_SYSTEM = (
     "You focus exclusively on user needs, user-centricity, usability, accessibility, and intuitive design.\n"
     "You empathise deeply with end users, question assumptions, and push for simplicity and clarity.\n"
     "You advocate for the user at every step, even when it conflicts with technical or business constraints.\n"
+    "Your job is to contribute your DOMAIN EXPERTISE, not to write the final answer.\n"
     "Keep your response brief — 2-3 sentences per section maximum.\n\n"
     "Respond in this exact format:\n"
     "USER NEEDS ANALYSIS:\n<who the users are and what they actually need from this>\n\n"
     "PAIN POINTS:\n<friction, confusion, or barriers users will face with current approaches>\n\n"
-    "UX RECOMMENDATIONS:\n<specific design improvements to make the experience intuitive and user-friendly>\n\n"
-    "USER-CENTRIC DRAFT:\n<the complete output redesigned with the user's needs at the centre>"
+    "UX RECOMMENDATIONS:\n<specific design improvements to make the experience intuitive and user-friendly>"
+    + STRUCTURED_OUTPUT_SUFFIX
 )
 
 _DORIS_SYSTEM = (
@@ -866,12 +907,13 @@ _DORIS_SYSTEM = (
     "You do not know anything about anything, but that has never stopped you from having plenty to say.\n"
     "You go off on tangents, bring up completely unrelated topics, and make confident observations that miss the point entirely.\n"
     "You are well-meaning but utterly clueless. You fill every section with irrelevant words.\n"
+    "Your job is to contribute your DOMAIN EXPERTISE (such as it is), not to write the final answer.\n"
     "Keep your response brief — 2-3 sentences per section maximum.\n\n"
     "Respond in this exact format:\n"
     "WHAT DORIS THINKS IS HAPPENING:\n<Doris's completely off-base interpretation of the task>\n\n"
     "DORIS'S THOUGHTS:\n<loosely related observations, a personal anecdote, and a non-sequitur>\n\n"
-    "ANYWAY:\n<an abrupt change of subject to something entirely unrelated>\n\n"
-    "DORIS'S TAKE:\n<Doris's well-meaning but thoroughly unhelpful conclusion>"
+    "ANYWAY:\n<an abrupt change of subject to something entirely unrelated>"
+    + STRUCTURED_OUTPUT_SUFFIX
 )
 
 _CHAIRMAN_SYSTEM = (
@@ -879,12 +921,13 @@ _CHAIRMAN_SYSTEM = (
     "You represent the highest level of corporate governance, fiduciary duty, and strategic oversight.\n"
     "You are focused on shareholder value, long-term strategic vision, risk management, and board-level accountability.\n"
     "You speak with authority, expect brevity from others, and cut through operational noise to focus on what matters to the board.\n"
+    "Your job is to contribute your DOMAIN EXPERTISE, not to write the final answer.\n"
     "Keep your response brief — 2-3 sentences per section maximum.\n\n"
     "Respond in this exact format:\n"
     "BOARD PERSPECTIVE:\n<how the board views this task in the context of strategic priorities>\n\n"
     "STRATEGIC CONCERNS:\n<risks, liabilities, or misalignments with corporate strategy>\n\n"
-    "SHAREHOLDER VALUE:\n<how this impacts shareholder value, ROI, and long-term growth>\n\n"
-    "BOARD DIRECTIVE:\n<the board's clear, authoritative recommendation or decision>"
+    "SHAREHOLDER VALUE:\n<how this impacts shareholder value, ROI, and long-term growth>"
+    + STRUCTURED_OUTPUT_SUFFIX
 )
 
 _MAGA_APPOINTEE_SYSTEM = (
@@ -892,12 +935,13 @@ _MAGA_APPOINTEE_SYSTEM = (
     "You champion deregulation, American jobs, national sovereignty, and cutting government waste.\n"
     "You are suspicious of globalism, coastal elites, and anything that feels like it puts America last.\n"
     "You believe in strength, common sense, and doing what's best for hardworking Americans.\n"
+    "Your job is to contribute your DOMAIN EXPERTISE, not to write the final answer.\n"
     "Keep your response brief — 2-3 sentences per section maximum.\n\n"
     "Respond in this exact format:\n"
     "AMERICA FIRST ANALYSIS:\n<how this task affects American workers, businesses, and national interests>\n\n"
     "DEEP STATE CONCERNS:\n<bureaucratic overreach, globalist agendas, or regulations that hurt Americans>\n\n"
-    "MAKING IT GREAT AGAIN:\n<the common-sense, America First approach that cuts through the nonsense>\n\n"
-    "MAGA DRAFT:\n<the complete output from an unapologetically America First perspective>"
+    "MAKING IT GREAT AGAIN:\n<the common-sense, America First approach that cuts through the nonsense>"
+    + STRUCTURED_OUTPUT_SUFFIX
 )
 
 _LAWYER_SYSTEM = (
@@ -905,12 +949,13 @@ _LAWYER_SYSTEM = (
     "You analyse everything through the lens of legal compliance, liability, contracts, and risk mitigation.\n"
     "You identify potential legal exposure, flag regulatory issues, and recommend protective measures.\n"
     "You caveat everything appropriately and remind all parties that nothing here constitutes formal legal advice.\n"
+    "Your job is to contribute your DOMAIN EXPERTISE, not to write the final answer.\n"
     "Keep your response brief — 2-3 sentences per section maximum.\n\n"
     "Respond in this exact format:\n"
     "LEGAL ANALYSIS:\n<assessment of legal issues, applicable laws, and regulatory considerations>\n\n"
     "LIABILITIES AND RISKS:\n<specific legal exposure, contractual risks, or compliance gaps>\n\n"
-    "LEGAL RECOMMENDATIONS:\n<protective measures, disclaimers, or required legal steps>\n\n"
-    "LEGAL DRAFT:\n<the complete output revised to address legal considerations — note: not formal legal advice>"
+    "LEGAL RECOMMENDATIONS:\n<protective measures, disclaimers, or required legal steps>"
+    + STRUCTURED_OUTPUT_SUFFIX
 )
 
 
@@ -1125,10 +1170,13 @@ def _step_qa(
     trace: List[str],
     all_outputs: Optional[List[Tuple[str, str]]] = None,
     evidence: Optional[EvidenceResult] = None,
+    structured_contributions: Optional[Dict[str, StructuredContribution]] = None,
 ) -> WorkflowState:
     """QA Tester: validate the draft against the original request, success criteria,
-    output format, brevity requirements, and evidence grounding.
+    output format, brevity requirements, evidence grounding, and expert influence.
 
+    When structured_contributions are provided, also checks that the final answer
+    materially incorporates expert contributions (expert_influence check).
     Produces a structured QAResult stored in state['qa_structured'].
     """
     trace.append("\n╔══ [QA TESTER] Reviewing output... ══╗")
@@ -1150,6 +1198,12 @@ def _step_qa(
     if evidence is not None:
         content += f"{format_evidence_for_qa(evidence)}\n\n"
 
+    # Inject expert contribution traceability for influence checking
+    if structured_contributions:
+        used = state.get("used_contributions", {})
+        traceability = format_contributions_for_qa(structured_contributions, used)
+        content += f"{traceability}\n\n"
+
     if all_outputs:
         content += "Individual specialist contributions:\n\n"
         for r_key, r_output in all_outputs:
@@ -1164,6 +1218,30 @@ def _step_qa(
 
     # Parse structured QA result
     qa_result = parse_structured_qa(text)
+
+    # Code-level expert influence check — append issues if contributions were ignored
+    if structured_contributions:
+        used = state.get("used_contributions", {})
+        influence_issues = check_expert_influence(
+            structured_contributions, used, state["draft_output"]
+        )
+        if influence_issues:
+            for issue_msg in influence_issues:
+                qa_result.issues.append(QAIssue(
+                    issue_type="expert_influence",
+                    message=issue_msg,
+                    owner="synthesizer",
+                ))
+            if qa_result.passed:
+                qa_result.status = "FAIL"
+                qa_result.reason = (
+                    qa_result.reason + " Expert influence check failed."
+                    if qa_result.reason else "Expert influence check failed."
+                )
+            trace.append(
+                f"  ⚠ Expert influence issues: {'; '.join(influence_issues)}"
+            )
+
     state["qa_structured"] = qa_result.to_dict()
     state["qa_passed"] = qa_result.passed
 
@@ -1580,18 +1658,16 @@ def _step_synthesize(
     trace: List[str],
     all_outputs: List[Tuple[str, str]],
     evidence: Optional[EvidenceResult] = None,
+    structured_contributions: Optional[Dict[str, StructuredContribution]] = None,
 ) -> WorkflowState:
     """Synthesizer: produce the final user-facing answer from specialist contributions.
 
+    When structured_contributions are provided, the synthesizer receives indexed
+    contribution data and must produce a USED_CONTRIBUTIONS traceability block.
     Obeys the detected output format and brevity requirement strictly.
     If evidence is available, injects it so the synthesizer prefers grounded claims.
     """
     trace.append("\n╔══ [SYNTHESIZER] Producing final answer... ══╗")
-    perspectives = []
-    for r_key, r_output in all_outputs:
-        r_label = AGENT_ROLES.get(r_key, r_key)
-        perspectives.append(f"=== {r_label} ===\n{r_output}")
-    combined = "\n\n".join(perspectives)
 
     # Build format-aware instructions
     fmt = state.get("output_format", "other")
@@ -1611,12 +1687,41 @@ def _step_synthesize(
             f"{format_evidence_for_prompt(evidence)}\n\n"
         )
 
-    content += f"Specialist contributions:\n\n{combined}"
+    # Prefer structured contributions when available
+    if structured_contributions:
+        formatted = format_contributions_for_synthesizer(structured_contributions)
+        content += formatted
+    else:
+        # Fallback: raw specialist outputs
+        perspectives = []
+        for r_key, r_output in all_outputs:
+            r_label = AGENT_ROLES.get(r_key, r_key)
+            perspectives.append(f"=== {r_label} ===\n{r_output}")
+        content += f"Specialist contributions:\n\n" + "\n\n".join(perspectives)
 
     text = _llm_call(chat_model, _SYNTHESIZER_SYSTEM, content)
+
+    # Parse used_contributions traceability from synthesizer output
+    used = parse_used_contributions(text)
+    state["used_contributions"] = used
+
+    # Strip the USED_CONTRIBUTIONS JSON block from the draft (user shouldn't see it)
+    draft = re.sub(
+        r"\n*USED_CONTRIBUTIONS:\s*```json.*?```",
+        "", text, flags=re.DOTALL,
+    ).strip()
+    # Also strip any standalone ```json block at the end that contains used_contributions
+    draft = re.sub(
+        r"\n*```json\s*\{[^}]*\"used_contributions\"[^}]*\}\s*```\s*$",
+        "", draft, flags=re.DOTALL,
+    ).strip()
+
     state["synthesis_output"] = text
-    state["draft_output"] = text
-    trace.append(text)
+    state["draft_output"] = draft
+    trace.append(draft[:500] + ("…" if len(draft) > 500 else ""))
+    if used:
+        used_count = sum(len(v) for v in used.values())
+        trace.append(f"  ℹ Traceability: {used_count} expert contribution(s) referenced")
     trace.append("╚══ [SYNTHESIZER] Done ══╝")
     return state
 
@@ -1662,6 +1767,7 @@ _EMPTY_STATE_BASE: WorkflowState = {
     "revision_count": 0, "final_answer": "",
     "output_format": "other", "brevity_requirement": "normal", "qa_structured": None,
     "task_assumptions": {}, "revision_instruction": "",
+    "structured_contributions": {}, "used_contributions": {},
 }
 
 
@@ -1930,6 +2036,8 @@ def run_multi_role_workflow(
         "qa_structured": None,
         "task_assumptions": {},
         "revision_instruction": "",
+        "structured_contributions": {},
+        "used_contributions": {},
     }
 
     trace: List[str] = [
@@ -2033,6 +2141,13 @@ def run_multi_role_workflow(
         primary_output = state["draft_output"]
         planner_state.specialist_outputs[primary_role] = primary_output[:500]
 
+        # Parse structured contribution from specialist output
+        structured_contributions: Dict[str, StructuredContribution] = {}
+        contrib = parse_structured_contribution(
+            primary_output, AGENT_ROLES.get(primary_role, primary_role)
+        )
+        structured_contributions[primary_role] = contrib
+
         all_outputs: List[Tuple[str, str]] = [(primary_role, primary_output)]
         for specialist_role in selected_roles:
             if specialist_role == primary_role:
@@ -2041,10 +2156,24 @@ def run_multi_role_workflow(
             output = state["draft_output"]
             all_outputs.append((specialist_role, output))
             planner_state.specialist_outputs[specialist_role] = output[:500]
+            # Parse structured contribution
+            contrib = parse_structured_contribution(
+                output, AGENT_ROLES.get(specialist_role, specialist_role)
+            )
+            structured_contributions[specialist_role] = contrib
 
-        # Step 5: Synthesize — format-aware, evidence-grounded
+        # Store structured contributions in state
+        state["structured_contributions"] = {
+            k: v.to_dict() for k, v in structured_contributions.items()
+        }
+        trace.append(
+            f"\n[CONTRIBUTIONS] {len(structured_contributions)} structured contribution(s) parsed"
+        )
+
+        # Step 5: Synthesize — format-aware, evidence-grounded, contribution-driven
         state = _step_synthesize(chat_model, state, trace, all_outputs,
-                                 evidence=evidence)
+                                 evidence=evidence,
+                                 structured_contributions=structured_contributions)
 
         # Step 5b: Pre-QA format validation — catch structural violations early
         fmt_violations = validate_output_format(
@@ -2059,7 +2188,8 @@ def run_multi_role_workflow(
             violation_instr = format_violations_instruction(fmt_violations)
             state["plan"] = state["plan"] + "\n\n" + violation_instr
             state = _step_synthesize(chat_model, state, trace, all_outputs,
-                                     evidence=evidence)
+                                     evidence=evidence,
+                                     structured_contributions=structured_contributions)
             planner_state.record_event("format_rewrite", "; ".join(fmt_violations))
             trace.append("[FORMAT VALIDATION] Re-synthesized to fix format violations.")
 
@@ -2069,7 +2199,8 @@ def run_multi_role_workflow(
             # Step 6: QA validation (with evidence context)
             if qa_active:
                 state = _step_qa(chat_model, state, trace, all_outputs,
-                                 evidence=evidence)
+                                 evidence=evidence,
+                                 structured_contributions=structured_contributions)
             else:
                 state["qa_passed"] = True
                 state["qa_report"] = "QA Tester is disabled — skipping quality review."
@@ -2169,6 +2300,12 @@ def run_multi_role_workflow(
                         state = _run_specialist(rk)
                         new_outputs.append((rk, state["draft_output"]))
                         planner_state.specialist_outputs[rk] = state["draft_output"][:500]
+                        # Re-parse structured contribution for rerun specialist
+                        contrib = parse_structured_contribution(
+                            state["draft_output"],
+                            AGENT_ROLES.get(rk, rk),
+                        )
+                        structured_contributions[rk] = contrib
 
                     # Merge: replace updated roles, keep others unchanged
                     updated_keys = {rk for rk, _ in new_outputs}
@@ -2176,9 +2313,15 @@ def run_multi_role_workflow(
                         (rk, out) for rk, out in all_outputs if rk not in updated_keys
                     ] + new_outputs
 
+                    # Update state with revised structured contributions
+                    state["structured_contributions"] = {
+                        k: v.to_dict() for k, v in structured_contributions.items()
+                    }
+
                 if rerun_synthesizer or rerun_specialists:
                     state = _step_synthesize(chat_model, state, trace, all_outputs,
-                                             evidence=evidence)
+                                             evidence=evidence,
+                                             structured_contributions=structured_contributions)
 
                     # Post-revision format validation
                     fmt_violations = validate_output_format(
@@ -2192,7 +2335,8 @@ def run_multi_role_workflow(
                         violation_instr = format_violations_instruction(fmt_violations)
                         state["plan"] = state["plan"] + "\n\n" + violation_instr
                         state = _step_synthesize(chat_model, state, trace, all_outputs,
-                                                 evidence=evidence)
+                                                 evidence=evidence,
+                                                 structured_contributions=structured_contributions)
 
                 # Loop back to QA — NOT back to specialists
                 continue
