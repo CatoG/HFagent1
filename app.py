@@ -11,6 +11,17 @@ from typing import Dict, List, Optional, Tuple, TypedDict
 import requests
 from dotenv import load_dotenv
 
+from workflow_helpers import (
+    WorkflowConfig, DEFAULT_CONFIG,
+    detect_output_format, detect_brevity_requirement,
+    QAResult, parse_structured_qa,
+    PlannerState,
+    select_relevant_roles, identify_revision_targets,
+    compress_final_answer, strip_internal_noise,
+    get_synthesizer_format_instruction, get_qa_format_instruction,
+    ROLE_RELEVANCE,
+)
+
 warnings.filterwarnings("ignore", category=UserWarning, module="wikipedia")
 load_dotenv()
 
@@ -562,37 +573,38 @@ class WorkflowState(TypedDict):
     qa_passed: bool
     revision_count: int
     final_answer: str
+    # New fields for the improved workflow
+    output_format: str      # detected output format (single_choice, short_answer, etc.)
+    brevity_requirement: str  # minimal, short, normal, verbose
+    qa_structured: Optional[dict]  # serialised QAResult for structured QA
 
 
 # --- Role system prompts ---
 
 _PLANNER_SYSTEM = (
-    "You are the Planner in a multi-role AI workflow.\n"
+    "You are the Planner in a strict planner–specialist–synthesizer–QA workflow.\n"
     "Your job is to:\n"
     "1. Break the user's task into clear subtasks.\n"
-    "2. Decide which specialist to call as the PRIMARY lead:\n"
+    "2. Decide which specialist to call as the PRIMARY lead.\n"
+    "   IMPORTANT: Select the FEWEST roles necessary. Do NOT call all roles.\n"
+    "   Available specialists:\n"
     "   - 'Creative Expert' (ideas, framing, wording, brainstorming)\n"
     "   - 'Technical Expert' (code, architecture, implementation)\n"
     "   - 'Research Analyst' (information gathering, literature review, fact-finding)\n"
-    "   - 'Security Reviewer' (security analysis, vulnerability checks, best practices)\n"
-    "   - 'Data Analyst' (data analysis, statistics, pattern recognition, insights)\n"
-    "   - 'Mad Professor' (radical scientific hypotheses, unhinged groundbreaking theories, extreme scientific speculation)\n"
-    "   - 'Accountant' (extreme cost scrutiny, ruthless cost-cutting, cheapest alternatives regardless of quality)\n"
-    "   - 'Artist' (wildly unhinged creative vision, cosmic feeling and vibes, impractical but spectacular ideas)\n"
-    "   - 'Lazy Slacker' (minimum viable effort, shortcuts, good-enough solutions, questioning whether anything needs to be done)\n"
-    "   - 'Black Metal Fundamentalist' (nihilistic kvlt critique, uncompromising rejection of mainstream approaches, raw truth)\n"
-    "   - 'Labour Union Representative' (worker rights, fair wages, job security, collective bargaining)\n"
-    "   - 'UX Designer' (user needs, user-centricity, usability, accessibility)\n"
-    "   - 'Doris' (well-meaning but clueless, rambling, off-topic observations)\n"
-    "   - 'Chairman of the Board' (corporate governance, shareholder value, strategic vision, fiduciary duty)\n"
-    "   - 'MAGA Appointee' (America First perspective, anti-globalism, deregulation, patriotism)\n"
-    "   - 'Lawyer' (legal compliance, liability, contracts, risk management)\n"
-    "3. State clear success criteria.\n\n"
-    "Note: ALL active specialists will also contribute their own perspective on the task.\n"
-    "Your PRIMARY ROLE choice sets the lead voice, but every active role will be heard.\n\n"
+    "   - 'Security Reviewer' (security analysis, vulnerability checks)\n"
+    "   - 'Data Analyst' (data analysis, statistics, patterns)\n"
+    "   - 'Labour Union Representative' (worker rights, fair wages)\n"
+    "   - 'UX Designer' (user needs, usability, accessibility)\n"
+    "   - 'Lawyer' (legal compliance, liability, contracts)\n"
+    "3. State clear success criteria.\n"
+    "4. Identify the required output format and brevity level.\n\n"
+    "RULES:\n"
+    "- For simple questions, ONE specialist is enough.\n"
+    "- Never call persona/gimmick roles unless the user explicitly asks for them.\n"
+    "- QA results are BINDING — if QA says FAIL, you MUST revise, never approve.\n\n"
     "Respond in this exact format:\n"
     "TASK BREAKDOWN:\n<subtask list>\n\n"
-    "ROLE TO CALL: <Creative Expert | Technical Expert | Research Analyst | Security Reviewer | Data Analyst | Mad Professor | Accountant | Artist | Lazy Slacker | Black Metal Fundamentalist | Labour Union Representative | UX Designer | Doris | Chairman of the Board | MAGA Appointee | Lawyer>\n\n"
+    "ROLE TO CALL: <specialist name>\n\n"
     "SUCCESS CRITERIA:\n<what a correct, complete answer looks like>\n\n"
     "GUIDANCE FOR SPECIALIST:\n<any constraints or focus areas>"
 )
@@ -618,30 +630,48 @@ _TECHNICAL_SYSTEM = (
 )
 
 _QA_SYSTEM = (
-    "You are the QA Tester in a multi-role AI workflow.\n"
-    "Check whether the output satisfies the original request and success criteria.\n"
-    "When individual specialist contributions are provided, give targeted feedback for each role\n"
-    "so they can refine their specific propositions in the next iteration.\n\n"
-    "Respond in this exact format:\n"
-    "REQUIREMENTS CHECKED:\n<list each requirement and whether it was met>\n\n"
-    "ISSUES FOUND:\n<defects or gaps — or 'None' if all requirements are met>\n\n"
-    "ROLE-SPECIFIC FEEDBACK:\n"
-    "<one bullet per specialist role that contributed, with targeted feedback on their contribution:\n"
-    " • Role Name: <specific feedback for that role to refine their proposition, or 'Satisfactory' if no issues>>\n\n"
-    "RESULT: <PASS | FAIL>\n\n"
-    "RECOMMENDED FIXES:\n<specific improvements — or 'None' if result is PASS>"
+    "You are the QA Tester in a strict planner–specialist–synthesizer–QA workflow.\n"
+    "Check whether the output satisfies the original request, success criteria,\n"
+    "output format requirements, and brevity requirements.\n\n"
+    "You MUST respond with a JSON object in this exact structure:\n"
+    '{\n'
+    '  \"status\": \"PASS\" or \"FAIL\",\n'
+    '  \"reason\": \"short explanation\",\n'
+    '  \"issues\": [\n'
+    '    {\n'
+    '      \"type\": \"format\" | \"brevity\" | \"constraint\" | \"consistency\" | \"directness\" | \"other\",\n'
+    '      \"message\": \"what is wrong\",\n'
+    '      \"owner\": \"Synthesizer\" | \"Planner\" | \"<specialist role name>\"\n'
+    '    }\n'
+    '  ],\n'
+    '  \"correction_instruction\": \"specific minimal fix\"\n'
+    '}\n\n'
+    "Validation rules:\n"
+    "- Check that the output DIRECTLY answers the user's question.\n"
+    "- Check that the output format matches what was requested (single choice, table, code, etc.).\n"
+    "- Check that brevity matches the requirement (do not accept verbose answers when short was requested).\n"
+    "- Check that no internal workflow noise (task breakdown, role routing, perspectives summary) is in the output.\n"
+    "- FAIL if any of the above checks fail.\n"
+    "- PASS only if ALL checks pass.\n"
 )
 
 _PLANNER_REVIEW_SYSTEM = (
-    "You are the Planner reviewing QA feedback in a multi-role AI workflow.\n"
-    "Based on the QA report, either approve the result or plan a revision.\n\n"
+    "You are the Planner reviewing QA feedback.\n"
+    "CRITICAL RULE: QA results are BINDING.\n"
+    "- If QA status is PASS: approve the result.\n"
+    "- If QA status is FAIL: you MUST revise. You may NOT approve a FAIL result.\n"
+    "- If this is the final revision (max reached) and QA still FAIL:\n"
+    "  you must directly fix the QA issues in your response before approving.\n\n"
     "If QA PASSED, respond with:\n"
     "DECISION: APPROVED\n"
-    "FINAL ANSWER:\n<the approved specialist output, reproduced in full>\n\n"
-    "If QA FAILED, respond with:\n"
+    "FINAL ANSWER:\n<the approved output, reproduced in full>\n\n"
+    "If QA FAILED and revisions remain, respond with:\n"
     "DECISION: REVISE\n"
-    "ROLE TO CALL: <Creative Expert | Technical Expert | Research Analyst | Security Reviewer | Data Analyst | Mad Professor | Accountant | Artist | Lazy Slacker | Black Metal Fundamentalist | Labour Union Representative | UX Designer | Doris | Chairman of the Board | MAGA Appointee | Lawyer>\n"
-    "REVISED INSTRUCTIONS:\n<specific fixes the specialist must address>"
+    "ROLE TO CALL: <specialist name>\n"
+    "REVISED INSTRUCTIONS:\n<specific fixes to address the QA issues>\n\n"
+    "If QA FAILED and this is the FINAL revision, respond with:\n"
+    "DECISION: APPROVED\n"
+    "FINAL ANSWER:\n<the output with QA issues directly corrected by you>"
 )
 
 _RESEARCH_SYSTEM = (
@@ -748,18 +778,17 @@ _BLACK_METAL_FUNDAMENTALIST_SYSTEM = (
 )
 
 _SYNTHESIZER_SYSTEM = (
-    "You are the Synthesizer in a multi-role AI workflow.\n"
-    "You have received perspectives on a task from multiple specialist roles.\n"
-    "Your job is to:\n"
-    "1. Briefly summarise each specialist's key point or recommendation.\n"
-    "2. Identify themes, ideas, and recommendations that appear across multiple perspectives (common ground).\n"
-    "3. Acknowledge genuine differences or tensions between perspectives.\n"
-    "4. Produce a single, balanced, unified recommendation that draws on the strongest insights from all roles.\n\n"
-    "Respond in this exact format:\n"
-    "PERSPECTIVES SUMMARY:\n<one concise bullet per role: • Role Name — key point or recommendation>\n\n"
-    "COMMON GROUND:\n<shared themes, ideas, or approaches that multiple roles agree on>\n\n"
-    "TENSIONS AND TRADE-OFFS:\n<genuine disagreements or trade-offs between perspectives — or 'None' if all perspectives align>\n\n"
-    "UNIFIED RECOMMENDATION:\n<a balanced, synthesized answer that incorporates the strongest insights from all perspectives>"
+    "You are the Synthesizer in a strict planner–specialist–synthesizer–QA workflow.\n"
+    "You have received specialist contributions and must produce the FINAL answer.\n\n"
+    "CRITICAL RULES:\n"
+    "- Your output IS the final user-facing answer. It must directly answer the user's question.\n"
+    "- You MUST obey the requested output format strictly.\n"
+    "- Do NOT add sections like 'Perspectives Summary', 'Common Ground', 'Trade-offs',\n"
+    "  'Tensions', or any multi-section structure UNLESS the user explicitly requested\n"
+    "  a report or analysis.\n"
+    "- Do NOT include internal workflow information (role names, task breakdowns, etc.).\n"
+    "- Default to the SHORTEST adequate answer.\n\n"
+    "Output ONLY the final answer in the requested format. Nothing else."
 )
 
 _LABOUR_UNION_REP_SYSTEM = (
@@ -983,7 +1012,13 @@ def _parse_qa_role_feedback(qa_text: str) -> Dict[str, str]:
 def _step_plan(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowState:
     """Planner: analyse the task, produce a plan, decide which specialist to call."""
     trace.append("\n╔══ [PLANNER] Analysing task... ══╗")
-    content = f"User request: {state['user_request']}"
+    fmt = state.get("output_format", "other")
+    brevity = state.get("brevity_requirement", "normal")
+    content = (
+        f"User request: {state['user_request']}\n"
+        f"Required output format: {fmt}\n"
+        f"Brevity requirement: {brevity}"
+    )
     if state["revision_count"] > 0:
         content += (
             f"\n\nThis is revision {state['revision_count']} of {MAX_REVISIONS}."
@@ -1046,74 +1081,126 @@ def _step_qa(
     trace: List[str],
     all_outputs: Optional[List[Tuple[str, str]]] = None,
 ) -> WorkflowState:
-    """QA Tester: check the draft against the original request and success criteria.
+    """QA Tester: validate the draft against the original request, success criteria,
+    output format, and brevity requirements.
 
-    When *all_outputs* is provided (list of (role_key, output) pairs from this
-    iteration), each specialist's individual contribution is included in the
-    review prompt so the QA can supply targeted, per-role feedback.  This
-    feedback is stored in ``state['qa_role_feedback']`` and consumed by the
-    specialist step functions on the next revision pass.
+    Produces a structured QAResult stored in state['qa_structured'].
     """
     trace.append("\n╔══ [QA TESTER] Reviewing output... ══╗")
+
+    fmt = state.get("output_format", "other")
+    brevity = state.get("brevity_requirement", "normal")
+    format_rules = get_qa_format_instruction(fmt, brevity)
+
     content = (
         f"Original user request: {state['user_request']}\n\n"
+        f"Required output format: {fmt}\n"
+        f"Brevity requirement: {brevity}\n\n"
         f"Planner's plan and success criteria:\n{state['plan']}\n\n"
     )
+    if format_rules:
+        content += f"FORMAT VALIDATION RULES:\n{format_rules}\n\n"
+
     if all_outputs:
-        # Include each specialist's individual output so QA can give role-specific feedback
         content += "Individual specialist contributions:\n\n"
         for r_key, r_output in all_outputs:
             r_label = AGENT_ROLES.get(r_key, r_key)
             content += f"=== {r_label} ===\n{r_output}\n\n"
-        content += f"Synthesized unified output:\n{state['draft_output']}"
+        content += f"Synthesized output to validate:\n{state['draft_output']}"
     else:
-        content += f"Specialist output to review:\n{state['draft_output']}"
+        content += f"Output to validate:\n{state['draft_output']}"
+
     text = _llm_call(chat_model, _QA_SYSTEM, content)
     state["qa_report"] = text
+
+    # Parse structured QA result
+    qa_result = parse_structured_qa(text)
+    state["qa_structured"] = qa_result.to_dict()
+    state["qa_passed"] = qa_result.passed
+
+    # Also extract legacy role feedback for backward compatibility
     state["qa_role_feedback"] = _parse_qa_role_feedback(text)
-    state["qa_passed"] = _qa_passed_check(text)
+
     result_label = "✅ PASS" if state["qa_passed"] else "❌ FAIL"
     trace.append(text)
-    if state["qa_role_feedback"]:
-        feedback_summary = ", ".join(
-            f"{AGENT_ROLES.get(k, k)}: {v[:60]}{'…' if len(v) > 60 else ''}"
-            for k, v in state["qa_role_feedback"].items()
+    if qa_result.issues:
+        issues_summary = "; ".join(
+            f"{i.owner}: {i.message[:60]}{'…' if len(i.message) > 60 else ''}"
+            for i in qa_result.issues
         )
-        trace.append(f"  ℹ Role-specific feedback dispatched → {feedback_summary}")
+        trace.append(f"  ℹ QA issues: {issues_summary}")
     trace.append(f"╚══ [QA TESTER] Result: {result_label} ══╝")
     return state
 
 
-def _step_planner_review(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowState:
-    """Planner: review QA feedback and either approve the result or request a revision."""
+def _step_planner_review(
+    chat_model, state: WorkflowState, trace: List[str],
+    is_final_revision: bool = False,
+) -> WorkflowState:
+    """Planner: review QA feedback and either approve or request revision.
+
+    QA-BINDING LOGIC (enforced in code, not just prompt):
+    - If QA passed → approve
+    - If QA failed and revisions remain → MUST revise (code blocks approval)
+    - If QA failed and max revisions reached → planner does final correction pass
+    """
     trace.append("\n╔══ [PLANNER] Reviewing QA feedback... ══╗")
+
+    fmt = state.get("output_format", "other")
+    brevity = state.get("brevity_requirement", "normal")
+
     content = (
         f"User request: {state['user_request']}\n\n"
+        f"Required output format: {fmt}\n"
+        f"Brevity requirement: {brevity}\n\n"
         f"Plan:\n{state['plan']}\n\n"
-        f"Specialist output:\n{state['draft_output']}\n\n"
+        f"Current draft:\n{state['draft_output']}\n\n"
         f"QA report:\n{state['qa_report']}"
     )
+
+    if is_final_revision:
+        content += (
+            "\n\nThis is the FINAL revision. Max revisions reached. "
+            "You MUST directly fix all QA issues in your FINAL ANSWER now."
+        )
+
     review = _llm_call(chat_model, _PLANNER_REVIEW_SYSTEM, content)
     trace.append(review)
 
-    if "DECISION: APPROVED" in review.upper():
-        # Extract the final answer that the Planner reproduced in full
+    # QA-binding enforcement: code-level check prevents approving a FAIL
+    if state["qa_passed"]:
+        # QA passed — approve
         parts = review.split("FINAL ANSWER:", 1)
         if len(parts) > 1:
             state["final_answer"] = parts[1].strip()
         else:
-            # Planner approved but omitted the expected FINAL ANSWER section — use draft
-            trace.append("  ⚠ FINAL ANSWER section missing; using specialist draft as final answer.")
             state["final_answer"] = state["draft_output"]
         trace.append("╚══ [PLANNER] → ✅ APPROVED ══╝")
+    elif is_final_revision:
+        # QA failed but max revisions reached — planner does final correction
+        parts = review.split("FINAL ANSWER:", 1)
+        if len(parts) > 1:
+            state["final_answer"] = parts[1].strip()
+        else:
+            # Planner didn't produce a corrected answer — use draft
+            state["final_answer"] = state["draft_output"]
+        trace.append("╚══ [PLANNER] → ✅ APPROVED (final revision, QA issues corrected) ══╝")
     else:
-        # Planner requests a revision — update plan with revised instructions
+        # QA failed and revisions remain — MUST revise regardless of LLM output
+        # Even if the LLM says APPROVED, we override and force revision
+        if "DECISION: APPROVED" in review.upper():
+            trace.append("  ⚠ Planner tried to approve a FAIL result — overriding to REVISE (QA is binding)")
+
         parts = review.split("REVISED INSTRUCTIONS:", 1)
         if len(parts) > 1:
             state["plan"] = parts[1].strip()
         else:
-            # Revision requested but REVISED INSTRUCTIONS section missing — keep current plan
-            trace.append("  ⚠ REVISED INSTRUCTIONS section missing; retrying with existing plan.")
+            trace.append("  ⚠ REVISED INSTRUCTIONS missing; using QA correction instruction.")
+            # Use QA's correction instruction if planner didn't provide one
+            qa_data = state.get("qa_structured")
+            if qa_data and qa_data.get("correction_instruction"):
+                state["plan"] = qa_data["correction_instruction"]
+
         state["current_role"] = _decide_role(review)
         trace.append(
             f"╚══ [PLANNER] → 🔄 REVISE — routing to {state['current_role'].upper()} EXPERT ══╝"
@@ -1421,16 +1508,28 @@ def _step_synthesize(
     trace: List[str],
     all_outputs: List[Tuple[str, str]],
 ) -> WorkflowState:
-    """Synthesizer: summarise all specialist perspectives, find common ground, and produce a unified recommendation."""
-    trace.append("\n╔══ [SYNTHESIZER] Summarising perspectives and finding common ground... ══╗")
+    """Synthesizer: produce the final user-facing answer from specialist contributions.
+
+    Obeys the detected output format and brevity requirement strictly.
+    """
+    trace.append("\n╔══ [SYNTHESIZER] Producing final answer... ══╗")
     perspectives = []
     for r_key, r_output in all_outputs:
         r_label = AGENT_ROLES.get(r_key, r_key)
         perspectives.append(f"=== {r_label} ===\n{r_output}")
     combined = "\n\n".join(perspectives)
+
+    # Build format-aware instructions
+    fmt = state.get("output_format", "other")
+    brevity = state.get("brevity_requirement", "normal")
+    format_instruction = get_synthesizer_format_instruction(fmt, brevity)
+
     content = (
         f"User request: {state['user_request']}\n\n"
-        f"Specialist perspectives collected:\n\n{combined}"
+        f"REQUIRED OUTPUT FORMAT: {fmt}\n"
+        f"BREVITY: {brevity}\n\n"
+        f"{format_instruction}\n\n"
+        f"Specialist contributions:\n\n{combined}"
     )
     text = _llm_call(chat_model, _SYNTHESIZER_SYSTEM, content)
     state["synthesis_output"] = text
@@ -1479,6 +1578,7 @@ _EMPTY_STATE_BASE: WorkflowState = {
     "synthesis_output": "",
     "draft_output": "", "qa_report": "", "qa_role_feedback": {}, "qa_passed": False,
     "revision_count": 0, "final_answer": "",
+    "output_format": "other", "brevity_requirement": "normal", "qa_structured": None,
 }
 
 
@@ -1650,25 +1750,26 @@ def run_multi_role_workflow(
     message: str,
     model_id: str,
     active_role_labels: Optional[List[str]] = None,
+    config: Optional[WorkflowConfig] = None,
 ) -> Tuple[str, str]:
-    """Run the supervisor-style multi-role workflow.
+    """Run the strict planner–specialist–synthesizer–QA workflow.
 
     Flow:
-      1. Planner (if active) analyses the task and picks a primary specialist.
-      2. ALL active specialists run and contribute their own perspective.
-      3. Synthesizer summarises all perspectives, finds common ground, and produces a unified recommendation.
-      4. QA Tester (if active) reviews the synthesized output and provides targeted, per-role feedback
-         so each specialist knows exactly what to improve in the next iteration.
-      5. Planner (if active) reviews QA result and either approves or requests a revision.
-      6. Repeat from step 2 if QA fails and retries remain — each specialist now receives their own
-         targeted QA feedback and refines their proposition accordingly (iterative approach).
-      7. If max retries are reached, return best attempt with QA concerns.
+      1. Detect output format and brevity from the user request.
+      2. Planner (if active) analyses the task and picks a primary specialist.
+      3. Role selection filters to only relevant specialists (not all active roles).
+      4. Selected specialists run and contribute.
+      5. Synthesizer produces a format-aware final answer.
+      6. QA validates against format, brevity, and correctness.
+      7. QA-BINDING: if FAIL, planner MUST revise. Code enforces this.
+      8. Targeted revisions: only rerun failing role(s), not the whole set.
+      9. Final answer is compressed and stripped of internal noise.
 
     Args:
         message: The user's task or request.
         model_id: HuggingFace model ID to use.
-        active_role_labels: Display names of active agent roles (e.g. ["Planner", "Technical Expert"]).
-                            Defaults to all roles when None.
+        active_role_labels: Display names of active agent roles.
+        config: WorkflowConfig controlling strict_mode, persona roles, etc.
 
     Returns:
         (final_answer, workflow_trace_text)
@@ -1676,13 +1777,14 @@ def run_multi_role_workflow(
     global _workflow_model_id
     _workflow_model_id = model_id
     chat_model = build_provider_chat(model_id)
+    if config is None:
+        config = DEFAULT_CONFIG
 
     # Resolve active role keys from display labels
     if active_role_labels is None:
         active_role_labels = list(AGENT_ROLES.values())
     active_keys = {_ROLE_LABEL_TO_KEY[lbl] for lbl in active_role_labels if lbl in _ROLE_LABEL_TO_KEY}
 
-    # Determine which specialist keys are active (ordered list for deterministic fallback)
     all_specialist_keys = [
         "creative", "technical", "research", "security", "data_analyst",
         "mad_professor", "accountant", "artist", "lazy_slacker", "black_metal_fundamentalist",
@@ -1695,6 +1797,19 @@ def run_multi_role_workflow(
 
     if not active_specialist_keys:
         return "No specialist agents are active. Please enable at least one specialist role.", ""
+
+    # Step 1: Detect output format and brevity BEFORE any LLM calls
+    output_format = detect_output_format(message)
+    brevity = detect_brevity_requirement(message)
+
+    # Initialise planner state for tracking across revisions
+    planner_state = PlannerState(
+        user_request=message,
+        output_format=output_format,
+        brevity_requirement=brevity,
+        max_revisions=MAX_REVISIONS,
+    )
+    planner_state.record_event("init", f"format={output_format}, brevity={brevity}")
 
     state: WorkflowState = {
         "user_request": message,
@@ -1723,94 +1838,166 @@ def run_multi_role_workflow(
         "qa_passed": False,
         "revision_count": 0,
         "final_answer": "",
+        "output_format": output_format,
+        "brevity_requirement": brevity,
+        "qa_structured": None,
     }
 
     trace: List[str] = [
         "═══ MULTI-ROLE WORKFLOW STARTED ═══",
         f"Model   : {model_id}",
         f"Request : {message}",
-        f"Active roles: {', '.join(active_role_labels)}",
+        f"Output format: {output_format}",
+        f"Brevity: {brevity}",
+        f"Strict mode: {config.strict_mode}",
+        f"Allow persona roles: {config.allow_persona_roles}",
+        f"Max specialists per task: {config.max_specialists_per_task}",
         f"Max revisions: {MAX_REVISIONS}",
     ]
 
     try:
         if planner_active:
-            # Step 1: Planner creates the initial plan
             state = _step_plan(chat_model, state, trace)
         else:
-            # No planner: auto-select first active specialist
             state["current_role"] = active_specialist_keys[0]
             state["plan"] = message
             trace.append(
                 f"\n[Planner disabled] Auto-routing to: {state['current_role'].upper()}"
             )
 
-        # Orchestration loop: specialists → QA → Planner review → revise if needed
-        while True:
-            # Step 2: invoke the planner's chosen specialist first (primary lead),
-            # then run every other active specialist so all voices are heard.
-            primary_role = state["current_role"]
-            if primary_role not in active_specialist_keys:
-                primary_role = active_specialist_keys[0]
-                state["current_role"] = primary_role
-                trace.append(f"  ⚠ Requested role not active — routing to {primary_role.upper()}")
+        # Step 2: Select only RELEVANT roles instead of running all active specialists
+        if config.strict_mode:
+            selected_roles = select_relevant_roles(message, active_specialist_keys, config)
+        else:
+            selected_roles = active_specialist_keys
 
-            # Run the primary (planner-chosen) specialist
+        # Ensure the planner's primary choice is included if it's active
+        primary_role = state["current_role"]
+        if primary_role in active_specialist_keys and primary_role not in selected_roles:
+            selected_roles.insert(0, primary_role)
+
+        # Enforce max_specialists_per_task
+        selected_roles = selected_roles[:config.max_specialists_per_task]
+
+        planner_state.selected_roles = selected_roles
+        trace.append(
+            f"\n[ROLE SELECTION] {len(selected_roles)} specialist(s) selected: "
+            + ", ".join(AGENT_ROLES.get(k, k) for k in selected_roles)
+        )
+
+        # Main orchestration loop
+        while True:
+            # Step 3: Run selected specialists
+            if primary_role not in selected_roles:
+                primary_role = selected_roles[0]
+                state["current_role"] = primary_role
+
             primary_fn = _SPECIALIST_STEPS.get(primary_role, _step_technical)
             state = primary_fn(chat_model, state, trace)
             primary_output = state["draft_output"]
 
-            # Run all other active specialists and collect their perspectives
             all_outputs: List[Tuple[str, str]] = [(primary_role, primary_output)]
-            for specialist_role in active_specialist_keys:
+            for specialist_role in selected_roles:
                 if specialist_role == primary_role:
-                    continue  # already ran above
+                    continue
                 step_fn = _SPECIALIST_STEPS[specialist_role]
                 state = step_fn(chat_model, state, trace)
-                # state["draft_output"] is set by every step function immediately
-                # before returning, so it is always this specialist's fresh output.
                 all_outputs.append((specialist_role, state["draft_output"]))
 
-            # Synthesize all perspectives into a summary with common ground and a
-            # unified recommendation; use the synthesis as the QA/Planner draft.
+            # Step 4: Synthesize — format-aware
             if len(all_outputs) > 1:
                 trace.append(
-                    f"\n[ALL PERSPECTIVES COLLECTED] {len(all_outputs)} specialist(s) contributed — synthesizing..."
+                    f"\n[PERSPECTIVES COLLECTED] {len(all_outputs)} specialist(s) — synthesizing..."
                 )
                 state = _step_synthesize(chat_model, state, trace, all_outputs)
             else:
-                state["draft_output"] = primary_output
+                # Single specialist — still run through synthesizer for format compliance
+                state = _step_synthesize(chat_model, state, trace, all_outputs)
 
-            # Step 3: QA reviews the specialist's draft (if enabled)
+            # Step 5: QA validation
             if qa_active:
                 state = _step_qa(chat_model, state, trace, all_outputs)
             else:
                 state["qa_passed"] = True
                 state["qa_report"] = "QA Tester is disabled — skipping quality review."
+                state["qa_structured"] = {"status": "PASS", "reason": "", "issues": [], "correction_instruction": ""}
                 trace.append("\n[QA Tester disabled] Skipping quality review — auto-pass.")
 
-            # Step 4: Planner reviews QA and either approves or schedules a revision
-            if planner_active and qa_active:
-                state = _step_planner_review(chat_model, state, trace)
+            # Update planner state
+            planner_state.current_draft = state["draft_output"]
+            qa_result = parse_structured_qa(state["qa_report"]) if qa_active else QAResult(status="PASS")
+            planner_state.qa_result = qa_result
+            planner_state.record_event("qa", f"status={qa_result.status}")
 
-                # Exit if the Planner approved the result
+            # Step 6: QA-BINDING planner review
+            if planner_active and qa_active:
+                is_final_revision = (state["revision_count"] + 1 >= MAX_REVISIONS) and not state["qa_passed"]
+                state = _step_planner_review(chat_model, state, trace, is_final_revision=is_final_revision)
+
                 if state["final_answer"]:
                     trace.append("\n═══ WORKFLOW COMPLETE — APPROVED ═══")
                     break
 
-                # Increment revision counter and enforce the retry limit
+                # QA failed and planner was forced to revise
                 state["revision_count"] += 1
+                planner_state.revision_count = state["revision_count"]
+
                 if state["revision_count"] >= MAX_REVISIONS:
-                    state["final_answer"] = state["draft_output"]
+                    # Max revisions — planner does final correction pass
                     trace.append(
-                        f"\n═══ MAX REVISIONS REACHED ({MAX_REVISIONS}) ═══\n"
-                        f"Returning best attempt. Outstanding QA concerns:\n{state['qa_report']}"
+                        f"\n═══ MAX REVISIONS ({MAX_REVISIONS}) — FINAL CORRECTION PASS ═══"
                     )
+                    state = _step_planner_review(chat_model, state, trace, is_final_revision=True)
+                    if not state["final_answer"]:
+                        state["final_answer"] = state["draft_output"]
+                    trace.append("\n═══ WORKFLOW COMPLETE — MAX REVISIONS ═══")
                     break
 
-                trace.append(f"\n═══ REVISION {state['revision_count']} / {MAX_REVISIONS} ═══")
+                # Step 7: TARGETED REVISIONS — only rerun failing role(s)
+                revision_targets = identify_revision_targets(qa_result, _ROLE_LABEL_TO_KEY)
+                trace.append(
+                    f"\n═══ REVISION {state['revision_count']} / {MAX_REVISIONS} ═══\n"
+                    f"Targeted roles: {', '.join(revision_targets)}"
+                )
+                planner_state.record_event("revision", f"targets={revision_targets}")
+
+                # Determine what to rerun
+                rerun_specialists = [
+                    t for t in revision_targets
+                    if t in _SPECIALIST_STEPS and t in selected_roles
+                ]
+                rerun_synthesizer = "synthesizer" in revision_targets or rerun_specialists
+
+                if rerun_specialists:
+                    # Only rerun the targeted specialists
+                    new_outputs = []
+                    for rk in rerun_specialists:
+                        step_fn = _SPECIALIST_STEPS[rk]
+                        state = step_fn(chat_model, state, trace)
+                        new_outputs.append((rk, state["draft_output"]))
+
+                    # Merge with previous outputs (replace updated roles)
+                    updated_keys = {rk for rk, _ in new_outputs}
+                    merged_outputs = [
+                        (rk, out) for rk, out in all_outputs if rk not in updated_keys
+                    ] + new_outputs
+                    all_outputs = merged_outputs
+
+                if rerun_synthesizer or rerun_specialists:
+                    state = _step_synthesize(chat_model, state, trace, all_outputs)
+
+                # Update selected_roles based on planner's new routing
+                primary_role = state["current_role"]
+                if primary_role in selected_roles:
+                    pass  # keep existing selection
+                elif primary_role in active_specialist_keys:
+                    selected_roles = [primary_role] + [r for r in selected_roles if r != primary_role]
+                    selected_roles = selected_roles[:config.max_specialists_per_task]
+
+                continue  # Loop back to QA
+
             else:
-                # No Planner review loop — accept the draft as the final answer
+                # No Planner review loop — accept the draft
                 state["final_answer"] = state["draft_output"]
                 trace.append("\n═══ WORKFLOW COMPLETE ═══")
                 break
@@ -1819,7 +2006,12 @@ def run_multi_role_workflow(
         trace.append(f"\n[ERROR] {exc}\n{traceback.format_exc()}")
         state["final_answer"] = state["draft_output"] or f"Workflow error: {exc}"
 
-    return state["final_answer"], "\n".join(trace)
+    # Step 8: FINAL ANSWER COMPRESSION — strip noise, enforce format
+    raw_answer = state["final_answer"]
+    final_answer = compress_final_answer(raw_answer, output_format, brevity, message)
+    final_answer = strip_internal_noise(final_answer)
+
+    return final_answer, "\n".join(trace)
 
 
 # ============================================================
@@ -2064,11 +2256,11 @@ with gr.Blocks(title="LLM + Agent tools demo", theme=gr.themes.Soft()) as demo:
         # ── Tab 1: Agent discussion demo ────────────────────────────────────
         with gr.Tab("Agent discussion demo"):
             gr.Markdown(
-                "## Supervisor-style Multi-Role Workflow\n"
-                "**Planner** \u2192 **Specialist** \u2192 **QA Tester** \u2192 **Planner review**\n\n"
-                "The Planner breaks the task, picks the right specialist, and reviews QA feedback. "
-                f"If QA fails, the loop repeats up to **{MAX_REVISIONS}** times before accepting the best attempt.\n\n"
-                "Use the checkboxes on the right to enable or disable individual agent roles."
+                "## Strict Planner–Specialist–Synthesizer–QA Workflow\n"
+                "**Planner** → **Selected Specialists** → **Synthesizer** → **QA** → **Planner review**\n\n"
+                "The Planner analyses the task, selects only relevant specialists, and enforces QA as binding. "
+                f"If QA fails, targeted revisions loop up to **{MAX_REVISIONS}** times.\n\n"
+                "Use the checkboxes on the right to enable/disable agent roles and configure workflow settings."
             )
 
             with gr.Row():
@@ -2083,7 +2275,7 @@ with gr.Blocks(title="LLM + Agent tools demo", theme=gr.themes.Soft()) as demo:
                     wf_input = gr.Textbox(
                         label="Question",
                         placeholder=(
-                            "Describe what you want the multi-role team to work on\u2026\n"
+                            "Describe what you want the multi-role team to work on…\n"
                             "e.g. 'Write a short blog post about the benefits of open-source AI'"
                         ),
                         lines=3,
@@ -2096,6 +2288,17 @@ with gr.Blocks(title="LLM + Agent tools demo", theme=gr.themes.Soft()) as demo:
                         value=list(AGENT_ROLES.values()),
                         label="Team",
                     )
+                    with gr.Accordion("Workflow Settings", open=False):
+                        strict_mode_toggle = gr.Checkbox(
+                            value=True, label="Strict mode (select only relevant roles)"
+                        )
+                        allow_persona_toggle = gr.Checkbox(
+                            value=False, label="Allow persona/gimmick roles"
+                        )
+                        max_specialists_slider = gr.Slider(
+                            minimum=1, maximum=8, step=1, value=3,
+                            label="Max specialists per task"
+                        )
 
             with gr.Row():
                 with gr.Column(scale=2):
@@ -2112,14 +2315,20 @@ with gr.Blocks(title="LLM + Agent tools demo", theme=gr.themes.Soft()) as demo:
                     )
 
             def _run_workflow_ui(
-                message: str, model_id: str, role_labels: List[str]
+                message: str, model_id: str, role_labels: List[str],
+                strict_mode: bool, allow_persona: bool, max_specialists: int,
             ) -> Tuple[str, str]:
                 """Gradio handler: validate input, run the workflow, return outputs."""
                 if not message or not message.strip():
                     return "No input provided.", ""
                 try:
+                    config = WorkflowConfig(
+                        strict_mode=strict_mode,
+                        allow_persona_roles=allow_persona,
+                        max_specialists_per_task=int(max_specialists),
+                    )
                     final_answer, trace = run_multi_role_workflow(
-                        message.strip(), model_id, role_labels
+                        message.strip(), model_id, role_labels, config=config
                     )
                     return final_answer, trace
                 except Exception as exc:
@@ -2127,14 +2336,16 @@ with gr.Blocks(title="LLM + Agent tools demo", theme=gr.themes.Soft()) as demo:
 
             wf_submit_btn.click(
                 fn=_run_workflow_ui,
-                inputs=[wf_input, wf_model_dropdown, active_agents],
+                inputs=[wf_input, wf_model_dropdown, active_agents,
+                        strict_mode_toggle, allow_persona_toggle, max_specialists_slider],
                 outputs=[wf_answer, wf_trace],
                 show_api=False,
             )
 
             wf_input.submit(
                 fn=_run_workflow_ui,
-                inputs=[wf_input, wf_model_dropdown, active_agents],
+                inputs=[wf_input, wf_model_dropdown, active_agents,
+                        strict_mode_toggle, allow_persona_toggle, max_specialists_slider],
                 outputs=[wf_answer, wf_trace],
                 show_api=False,
             )
