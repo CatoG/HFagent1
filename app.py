@@ -2056,8 +2056,7 @@ def run_agent(message, history, selected_tools, model_id, client_ip: str = ""):
 
 with gr.Blocks(title="LLM + Agent tools demo", theme=gr.themes.Soft()) as demo:
     gr.Markdown(
-        "# LLM + Agent tools demo\n"
-        "with selectable tools and extended debugging."
+        "# Catos agent and tools playground\n"
     )
 
     with gr.Tabs():
