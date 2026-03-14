@@ -1228,7 +1228,7 @@ def _step_qa(
         if influence_issues:
             for issue_msg in influence_issues:
                 qa_result.issues.append(QAIssue(
-                    issue_type="expert_influence",
+                    type="expert_influence",
                     message=issue_msg,
                     owner="synthesizer",
                 ))
@@ -1703,6 +1703,12 @@ def _step_synthesize(
 
     # Parse used_contributions traceability from synthesizer output
     used = parse_used_contributions(text)
+
+    # Normalize keys: LLMs write display names ("Technical Expert") but we need
+    # role keys ("technical") to match the structured_contributions dict.
+    label_to_key = {v: k for k, v in AGENT_ROLES.items()}
+    used = {label_to_key.get(k, k): v for k, v in used.items()}
+
     state["used_contributions"] = used
 
     # Strip the USED_CONTRIBUTIONS JSON block from the draft (user shouldn't see it)
