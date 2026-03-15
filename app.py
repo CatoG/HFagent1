@@ -19,6 +19,7 @@ from workflow_helpers import (
     PlannerState, FailureRecord,
     select_relevant_roles, identify_revision_targets,
     compress_final_answer, strip_internal_noise,
+    postprocess_format_fixes,
     get_synthesizer_format_instruction, get_qa_format_instruction,
     validate_output_format, format_violations_instruction,
     parse_task_assumptions, format_assumptions_for_prompt,
@@ -615,7 +616,7 @@ class WorkflowState(TypedDict):
 
 # --- Role system prompts ---
 
-_PLANNER_SYSTEM = (
+_PLANNER_SYSTEM_BASE = (
     "You are the Planner in a strict planner–specialist–synthesizer–QA workflow.\n"
     "Your ONLY job is to PLAN and DELEGATE. You do NOT write the answer.\n\n"
     "Your responsibilities:\n"
@@ -623,14 +624,7 @@ _PLANNER_SYSTEM = (
     "2. Decide which specialist to call as the PRIMARY lead.\n"
     "   IMPORTANT: Select the FEWEST roles necessary. Do NOT call all roles.\n"
     "   Available specialists:\n"
-    "   - 'Creative Expert' (ideas, framing, wording, brainstorming)\n"
-    "   - 'Technical Expert' (code, architecture, implementation)\n"
-    "   - 'Research Analyst' (information gathering, literature review, fact-finding)\n"
-    "   - 'Security Reviewer' (security analysis, vulnerability checks)\n"
-    "   - 'Data Analyst' (data analysis, statistics, patterns)\n"
-    "   - 'Labour Union Representative' (worker rights, fair wages)\n"
-    "   - 'UX Designer' (user needs, usability, accessibility)\n"
-    "   - 'Lawyer' (legal compliance, liability, contracts)\n"
+    "{specialist_list}"
     "3. State clear success criteria.\n"
     "4. Identify the required output format and brevity level.\n"
     "5. Define shared assumptions that ALL specialists must use.\n"
@@ -642,6 +636,7 @@ _PLANNER_SYSTEM = (
     "- The specialists will create the content. The Synthesizer will combine it.\n"
     "- For simple questions, ONE specialist is enough.\n"
     "- Never call persona/gimmick roles unless the user explicitly asks for them.\n"
+    "- Only select from the specialists listed above — no others are available.\n"
     "- QA results are BINDING — if QA says FAIL, you MUST revise, never approve.\n\n"
     "Respond in this exact format:\n"
     "TASK BREAKDOWN:\n<subtask list — what needs to be addressed, NOT the answers>\n\n"
@@ -651,6 +646,34 @@ _PLANNER_SYSTEM = (
     "SUCCESS CRITERIA:\n<what a correct, complete answer looks like>\n\n"
     "GUIDANCE FOR SPECIALIST:\n<delegation instructions — what to focus on, NOT answer content>"
 )
+
+
+def _build_planner_system(enabled_role_keys: List[str]) -> str:
+    """Build the planner system prompt with the actual enabled roles."""
+    role_descriptions = {
+        "creative": "'Creative Expert' (ideas, framing, wording, brainstorming)",
+        "technical": "'Technical Expert' (code, architecture, implementation)",
+        "research": "'Research Analyst' (information gathering, literature review, fact-finding)",
+        "security": "'Security Reviewer' (security analysis, vulnerability checks)",
+        "data_analyst": "'Data Analyst' (data analysis, statistics, patterns)",
+        "labour_union_rep": "'Labour Union Representative' (worker rights, fair wages)",
+        "ux_designer": "'UX Designer' (user needs, usability, accessibility)",
+        "lawyer": "'Lawyer' (legal compliance, liability, contracts)",
+        "mad_professor": "'Mad Professor' (wild ideas, provocative perspectives)",
+        "accountant": "'Accountant' (cost analysis, budgeting, financial review)",
+        "artist": "'Artist' (aesthetic vision, creative expression)",
+        "lazy_slacker": "'Lazy Slacker' (minimal effort, simple answers)",
+        "black_metal_fundamentalist": "'Black Metal Fundamentalist' (nihilistic perspective)",
+        "doris": "'Doris' (practical, no-nonsense perspective)",
+        "chairman_of_board": "'Chairman of the Board' (corporate strategy, governance)",
+        "maga_appointee": "'MAGA Appointee' (deregulation, America-first perspective)",
+    }
+    lines = []
+    for rk in enabled_role_keys:
+        desc = role_descriptions.get(rk, f"'{rk}'")
+        lines.append(f"   - {desc}\n")
+    specialist_list = "".join(lines) if lines else "   - (no specialists enabled)\n"
+    return _PLANNER_SYSTEM_BASE.format(specialist_list=specialist_list)
 
 _CREATIVE_SYSTEM = (
     "You are the Creative Expert in a multi-role AI workflow.\n"
@@ -680,17 +703,30 @@ _QA_SYSTEM = (
     "output format requirements, brevity requirements, AND expert influence.\n\n"
     "You MUST respond with a JSON object in this exact structure:\n"
     '{\n'
-    '  \"status\": \"PASS\" or \"FAIL\",\n'
-    '  \"reason\": \"short explanation\",\n'
-    '  \"issues\": [\n'
+    '  "status": "PASS" or "PASS_WITH_WARNINGS" or "FAIL",\n'
+    '  "reason": "short explanation",\n'
+    '  "warnings": ["optional list of minor cosmetic or stylistic notes"],\n'
+    '  "issues": [\n'
     '    {\n'
-    '      \"type\": \"format\" | \"brevity\" | \"constraint\" | \"consistency\" | \"directness\" | \"evidence\" | \"expert_influence\" | \"other\",\n'
-    '      \"message\": \"what is wrong\",\n'
-    '      \"owner\": \"Synthesizer\" | \"Planner\" | \"Research Analyst\" | \"<specialist role name>\"\n'
+    '      "type": "format" | "brevity" | "constraint" | "consistency" | "directness" | "evidence" | "expert_influence" | "other",\n'
+    '      "message": "what is wrong",\n'
+    '      "owner": "Synthesizer" | "Planner" | "Research Analyst" | "<specialist role name>"\n'
     '    }\n'
     '  ],\n'
-    '  \"correction_instruction\": \"specific minimal fix\"\n'
+    '  "correction_instruction": "specific minimal fix"\n'
     '}\n\n'
+    "STATUS LEVELS — use the right one:\n"
+    "- PASS: The answer is correct, complete, properly formatted, and meets all criteria.\n"
+    "- PASS_WITH_WARNINGS: The answer is substantively correct and usable, but has minor\n"
+    "  cosmetic or stylistic issues (e.g. slightly verbose, could be tighter, minor formatting\n"
+    "  quirks). List these in the 'warnings' array. Do NOT put them in 'issues'.\n"
+    "- FAIL: The answer has substantive problems — wrong content, missing key information,\n"
+    "  wrong format, ignores the question, unsupported claims, or expert contributions ignored.\n"
+    "  Only FAIL triggers a revision cycle.\n\n"
+    "FOCUS ON CONTENT, NOT COSMETICS:\n"
+    "- Minor bullet formatting, heading style, or whitespace are NOT reasons to FAIL.\n"
+    "- A slightly verbose answer that correctly addresses the question is PASS_WITH_WARNINGS, not FAIL.\n"
+    "- Reserve FAIL for answers that are genuinely wrong, incomplete, or miss the point.\n\n"
     "Validation rules:\n"
     "- Check that the output DIRECTLY answers the user's question.\n"
     "- Check that the output format matches what was requested (single choice, table, code, etc.).\n"
@@ -704,18 +740,19 @@ _QA_SYSTEM = (
     "  * If multiple experts contributed, their relevant points are incorporated or consciously noted.\n"
     "  * The answer is NOT just a paraphrase of planner text with no expert content.\n"
     "  * FAIL with type 'expert_influence' if expert contributions were ignored.\n"
-    "- FAIL if any of the above checks fail.\n"
-    "- PASS only if ALL checks pass.\n"
+    "- FAIL if any substantive check fails.\n"
+    "- PASS_WITH_WARNINGS if content is good but minor polish is needed.\n"
+    "- PASS only if ALL checks pass with no issues at all.\n"
 )
 
 _PLANNER_REVIEW_SYSTEM = (
     "You are the Planner reviewing QA feedback.\n"
     "CRITICAL RULE: QA results are BINDING.\n"
-    "- If QA status is PASS: approve the result.\n"
+    "- If QA status is PASS or PASS_WITH_WARNINGS: approve the result.\n"
     "- If QA status is FAIL: you MUST revise. You may NOT approve a FAIL result.\n"
     "- If this is the final revision (max reached) and QA still FAIL:\n"
     "  you must directly fix the QA issues in your response before approving.\n\n"
-    "If QA PASSED, respond with:\n"
+    "If QA PASSED (or PASS_WITH_WARNINGS), respond with:\n"
     "DECISION: APPROVED\n"
     "FINAL ANSWER:\n<the approved output, reproduced in full>\n\n"
     "If QA FAILED and revisions remain, respond with:\n"
@@ -1098,7 +1135,10 @@ def _parse_qa_role_feedback(qa_text: str) -> Dict[str, str]:
 # Each step receives the shared state and an append-only trace list,
 # updates state in place, appends log lines, and returns updated state.
 
-def _step_plan(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowState:
+def _step_plan(
+    chat_model, state: WorkflowState, trace: List[str],
+    enabled_role_keys: Optional[List[str]] = None,
+) -> WorkflowState:
     """Planner: analyse the task, produce a plan, decide which specialist to call."""
     trace.append("\n╔══ [PLANNER] Analysing task... ══╗")
     fmt = state.get("output_format", "other")
@@ -1114,7 +1154,8 @@ def _step_plan(chat_model, state: WorkflowState, trace: List[str]) -> WorkflowSt
             f"\nPrevious QA report:\n{state['qa_report']}"
             "\nAdjust the plan to address the QA issues."
         )
-    plan_text = _llm_call(chat_model, _PLANNER_SYSTEM, content)
+    planner_system = _build_planner_system(enabled_role_keys or [])
+    plan_text = _llm_call(chat_model, planner_system, content)
     state["plan"] = plan_text
     state["current_role"] = _decide_role(plan_text)
     trace.append(plan_text)
@@ -1180,6 +1221,9 @@ def _step_qa(
     Produces a structured QAResult stored in state['qa_structured'].
     """
     trace.append("\n╔══ [QA TESTER] Reviewing output... ══╗")
+
+    # Apply post-processing format fixes before QA evaluation
+    state["draft_output"] = postprocess_format_fixes(state["draft_output"])
 
     fmt = state.get("output_format", "other")
     brevity = state.get("brevity_requirement", "normal")
@@ -1248,8 +1292,12 @@ def _step_qa(
     # Also extract legacy role feedback for backward compatibility
     state["qa_role_feedback"] = _parse_qa_role_feedback(text)
 
-    result_label = "✅ PASS" if state["qa_passed"] else "❌ FAIL"
+    result_label = ("✅ PASS" if qa_result.status == "PASS"
+                     else "⚠ PASS_WITH_WARNINGS" if qa_result.passed_with_warnings
+                     else "❌ FAIL")
     trace.append(text)
+    if qa_result.warnings:
+        trace.append(f"  ⚠ QA warnings: {'; '.join(qa_result.warnings)}")
     if qa_result.issues:
         issues_summary = "; ".join(
             f"{i.owner}: {i.message[:60]}{'…' if len(i.message) > 60 else ''}"
@@ -2080,7 +2128,8 @@ def run_multi_role_workflow(
 
     try:
         if planner_active:
-            state = _step_plan(chat_model, state, trace)
+            state = _step_plan(chat_model, state, trace,
+                               enabled_role_keys=active_specialist_keys)
 
             # Parse shared task assumptions from planner output
             assumptions = parse_task_assumptions(state["plan"])
@@ -2123,6 +2172,9 @@ def run_multi_role_workflow(
             f"\n[ROLE SELECTION] {len(selected_roles)} specialist(s) selected: "
             + ", ".join(AGENT_ROLES.get(k, k) for k in selected_roles)
         )
+        # Append detailed scoring trace when available
+        if hasattr(selected_roles, 'format_trace'):
+            trace.append(selected_roles.format_trace(AGENT_ROLES))
 
         # Step 4: Run ALL selected specialists (initial run only)
         if primary_role not in selected_roles:
@@ -2210,7 +2262,7 @@ def run_multi_role_workflow(
             else:
                 state["qa_passed"] = True
                 state["qa_report"] = "QA Tester is disabled — skipping quality review."
-                state["qa_structured"] = {"status": "PASS", "reason": "", "issues": [], "correction_instruction": ""}
+                state["qa_structured"] = {"status": "PASS", "reason": "", "issues": [], "warnings": [], "correction_instruction": ""}
                 trace.append("\n[QA Tester disabled] Skipping quality review — auto-pass.")
 
             # Update planner state

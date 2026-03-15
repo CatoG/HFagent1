@@ -31,6 +31,7 @@ from workflow_helpers import (
     identify_revision_targets,
     strip_internal_noise,
     compress_final_answer,
+    postprocess_format_fixes,
     PlannerState,
     FailureRecord,
     get_synthesizer_format_instruction,
@@ -45,6 +46,10 @@ from workflow_helpers import (
     format_contributions_for_qa,
     parse_used_contributions,
     check_expert_influence,
+    extract_task_features,
+    ROLE_CAPABILITIES,
+    RoleScore,
+    score_roles,
 )
 from evidence import (
     EvidenceItem,
@@ -243,6 +248,167 @@ class TestStructuredQAParsing(unittest.TestCase):
         d = result.to_dict()
         self.assertEqual(d["status"], "FAIL")
         self.assertEqual(len(d["issues"]), 1)
+
+    def test_parse_json_pass_with_warnings(self):
+        """PASS_WITH_WARNINGS is parsed correctly from JSON."""
+        qa_text = json.dumps({
+            "status": "PASS_WITH_WARNINGS",
+            "reason": "Content is good but slightly verbose",
+            "warnings": ["Could be more concise", "Minor formatting quirk"],
+            "issues": [],
+            "correction_instruction": ""
+        })
+        result = parse_structured_qa(qa_text)
+        self.assertTrue(result.passed)
+        self.assertTrue(result.passed_with_warnings)
+        self.assertEqual(result.status, "PASS_WITH_WARNINGS")
+        self.assertEqual(len(result.warnings), 2)
+        self.assertIn("Could be more concise", result.warnings)
+        self.assertEqual(len(result.issues), 0)
+
+    def test_parse_legacy_pass_with_warnings(self):
+        """PASS_WITH_WARNINGS is recognized in legacy text format."""
+        qa_text = (
+            "REQUIREMENTS CHECKED:\n- All met\n\n"
+            "ISSUES FOUND:\nNone\n\n"
+            "RESULT: PASS_WITH_WARNINGS\n\n"
+            "RECOMMENDED FIXES:\nNone"
+        )
+        result = parse_structured_qa(qa_text)
+        self.assertTrue(result.passed)
+        self.assertTrue(result.passed_with_warnings)
+
+    def test_pass_with_warnings_to_dict_includes_warnings(self):
+        result = QAResult(
+            status="PASS_WITH_WARNINGS",
+            reason="Minor issues",
+            warnings=["Slightly verbose"],
+            issues=[],
+        )
+        d = result.to_dict()
+        self.assertEqual(d["status"], "PASS_WITH_WARNINGS")
+        self.assertEqual(d["warnings"], ["Slightly verbose"])
+
+    def test_pass_is_not_passed_with_warnings(self):
+        result = QAResult(status="PASS")
+        self.assertTrue(result.passed)
+        self.assertFalse(result.passed_with_warnings)
+
+    def test_fail_is_not_passed(self):
+        result = QAResult(status="FAIL")
+        self.assertFalse(result.passed)
+        self.assertFalse(result.passed_with_warnings)
+
+
+# ============================================================
+# Test: Post-Processing Format Fixes
+# ============================================================
+
+class TestPostprocessFormatFixes(unittest.TestCase):
+
+    def test_removes_markdown_headings(self):
+        text = "# Heading\nSome content.\n## Subheading\nMore content."
+        result = postprocess_format_fixes(text)
+        self.assertNotIn("#", result)
+        self.assertIn("Some content.", result)
+        self.assertIn("More content.", result)
+
+    def test_converts_bullets_to_sentences(self):
+        text = "- First point\n- Second point\n- Third point"
+        result = postprocess_format_fixes(text)
+        self.assertNotIn("- ", result)
+        self.assertIn("First point.", result)
+        self.assertIn("Second point.", result)
+
+    def test_collapses_blank_lines(self):
+        text = "Line 1\n\n\n\n\nLine 2"
+        result = postprocess_format_fixes(text)
+        self.assertNotIn("\n\n\n", result)
+        self.assertIn("Line 1", result)
+        self.assertIn("Line 2", result)
+
+    def test_removes_json_traces(self):
+        text = 'Answer here. {"status": "PASS", "reason": "ok"} End.'
+        result = postprocess_format_fixes(text)
+        self.assertNotIn('"status"', result)
+        self.assertIn("Answer here.", result)
+
+    def test_preserves_clean_text(self):
+        text = "This is already clean text with no issues."
+        result = postprocess_format_fixes(text)
+        self.assertEqual(result, text)
+
+
+# ============================================================
+# Test: Task Feature Extraction and Role Scoring
+# ============================================================
+
+class TestTaskFeatureExtraction(unittest.TestCase):
+
+    def test_extract_coding_features(self):
+        features = extract_task_features("write Python code to parse CSV", "coding_task")
+        self.assertIn("technical", features)
+
+    def test_extract_design_features(self):
+        features = extract_task_features("design a user interface for the dashboard")
+        self.assertIn("design", features)
+
+    def test_extract_research_features(self):
+        features = extract_task_features("research the history of quantum computing")
+        self.assertIn("research", features)
+
+    def test_extract_multiple_features(self):
+        features = extract_task_features("analyze data trends and compare security vulnerabilities")
+        self.assertIn("analysis", features)
+        self.assertIn("data", features)
+        self.assertIn("security", features)
+        self.assertIn("comparison", features)
+
+    def test_category_adds_implied_features(self):
+        features = extract_task_features("do something", "factual_question")
+        self.assertIn("research", features)
+
+
+class TestRoleScoring(unittest.TestCase):
+
+    def setUp(self):
+        self.all_roles = list(WorkflowConfig.CORE_ROLE_KEYS) + list(WorkflowConfig.PERSONA_ROLE_KEYS)
+        self.config = WorkflowConfig(strict_mode=True, allow_persona_roles=False, max_specialists_per_task=3)
+
+    def test_scores_are_populated(self):
+        features = extract_task_features("write Python code to build an API", "coding_task")
+        scores = score_roles(features, self.all_roles, self.config, "coding_task")
+        self.assertTrue(len(scores) > 0)
+        # Technical should score highest
+        technical_scores = [s for s in scores if s.role_key == "technical"]
+        self.assertTrue(len(technical_scores) == 1)
+        self.assertGreater(technical_scores[0].score, 0)
+
+    def test_persona_roles_filtered(self):
+        features = extract_task_features("budget analysis")
+        scores = score_roles(features, self.all_roles, self.config)
+        persona_scores = [s for s in scores if s.is_persona]
+        for ps in persona_scores:
+            self.assertTrue(ps.filtered_reason)
+
+    def test_persona_roles_allowed(self):
+        config = WorkflowConfig(strict_mode=True, allow_persona_roles=True, max_specialists_per_task=5)
+        features = extract_task_features("budget analysis")
+        scores = score_roles(features, self.all_roles, config)
+        accountant = [s for s in scores if s.role_key == "accountant"]
+        self.assertTrue(len(accountant) == 1)
+        self.assertEqual(accountant[0].filtered_reason, "")
+
+    def test_selection_result_format_trace(self):
+        config = WorkflowConfig(strict_mode=True, allow_persona_roles=False, max_specialists_per_task=3)
+        result = select_relevant_roles(
+            "write Python code", self.all_roles, config, task_category="coding_task"
+        )
+        self.assertTrue(hasattr(result, 'format_trace'))
+        trace = result.format_trace({"technical": "Technical Expert"})
+        self.assertIn("ROLE SCORING", trace)
+        self.assertIn("Task features:", trace)
+        self.assertIn("SELECTED", trace)
 
 
 # ============================================================

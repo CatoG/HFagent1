@@ -234,14 +234,19 @@ class QAIssue:
 
 @dataclass
 class QAResult:
-    status: str                          # "PASS" | "FAIL"
+    status: str                          # "PASS" | "PASS_WITH_WARNINGS" | "FAIL"
     reason: str = ""
     issues: List[QAIssue] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
     correction_instruction: str = ""
 
     @property
     def passed(self) -> bool:
-        return self.status == "PASS"
+        return self.status in ("PASS", "PASS_WITH_WARNINGS")
+
+    @property
+    def passed_with_warnings(self) -> bool:
+        return self.status == "PASS_WITH_WARNINGS"
 
     def owners(self) -> List[str]:
         """Return unique owner labels from issues."""
@@ -255,6 +260,7 @@ class QAResult:
                 {"type": i.type, "message": i.message, "owner": i.owner}
                 for i in self.issues
             ],
+            "warnings": self.warnings,
             "correction_instruction": self.correction_instruction,
         }
 
@@ -293,6 +299,7 @@ def parse_structured_qa(qa_text: str) -> QAResult:
                 status=data.get("status", "FAIL"),
                 reason=data.get("reason", ""),
                 issues=issues,
+                warnings=[str(w) for w in data.get("warnings", [])],
                 correction_instruction=data.get("correction_instruction", ""),
             )
         except (json.JSONDecodeError, KeyError):
@@ -301,7 +308,9 @@ def parse_structured_qa(qa_text: str) -> QAResult:
     # Fallback: parse from legacy text format
     status = "FAIL"
     lower = qa_text.lower()
-    if "result: pass" in lower:
+    if "result: pass_with_warnings" in lower:
+        status = "PASS_WITH_WARNINGS"
+    elif "result: pass" in lower:
         status = "PASS"
 
     reason = ""
@@ -491,72 +500,188 @@ ROLE_RELEVANCE: Dict[str, Dict[str, Any]] = {
 }
 
 
+# ============================================================
+# Role Capability Metadata and Task Feature Extraction
+# ============================================================
+
+# Simple capability tags per role — used for transparent scoring
+ROLE_CAPABILITIES: Dict[str, List[str]] = {
+    "creative": ["creative", "design", "ideas", "writing", "brainstorm", "opinion"],
+    "technical": ["technical", "analysis", "engineering", "calculation", "code", "implementation"],
+    "research": ["research", "facts", "evidence", "information", "comparison", "history"],
+    "security": ["risk", "safety", "compliance", "security", "vulnerability"],
+    "data_analyst": ["data", "statistics", "analysis", "metrics", "patterns"],
+    "labour_union_rep": ["labor", "policy", "workplace", "rights", "fairness"],
+    "ux_designer": ["design", "usability", "interface", "user_experience", "accessibility"],
+    "lawyer": ["legal", "compliance", "contracts", "liability", "regulation"],
+    "mad_professor": ["persona", "speculation", "radical", "humor"],
+    "accountant": ["persona", "cost", "budget", "financial"],
+    "artist": ["persona", "creative", "aesthetic", "vision"],
+    "lazy_slacker": ["persona", "simple_answer", "minimal"],
+    "black_metal_fundamentalist": ["persona", "stylistic", "humor", "music"],
+    "doris": ["persona", "humor"],
+    "chairman_of_board": ["persona", "strategy", "corporate", "governance"],
+    "maga_appointee": ["persona", "political", "deregulation"],
+}
+
+# Keywords in the user request that map to task features
+TASK_FEATURE_KEYWORDS: Dict[str, List[str]] = {
+    "analysis": ["analy", "evaluate", "assess", "review", "examine", "investigate"],
+    "creative": ["creative", "brainstorm", "ideas", "imagine", "invent", "story", "write a"],
+    "design": ["design", "wireframe", "prototype", "layout", "visual", "ui", "ux", "interface", "usability",
+               "user experience", "accessibility", "login page", "user interface"],
+    "technical": ["code", "implement", "build", "architecture", "api", "debug", "software", "program",
+                   "algorithm", "system", "deploy", "python", "javascript", "rust", "java", "react",
+                   "framework", "performance"],
+    "research": ["research", "study", "evidence", "literature", "paper", "facts", "history",
+                  "information", "find out", "look up"],
+    "policy": ["policy", "regulation", "law", "compliance", "legal", "rights", "labor", "labour",
+                "union", "worker", "employment", "workplace"],
+    "simple_answer": ["yes or no", "pick one", "choose", "which one", "red or blue", "agree on one"],
+    "opinion": ["opinion", "perspective", "viewpoint", "discuss", "debate", "pros and cons",
+                 "should i", "what do you think", "agree", "disagree"],
+    "comparison": ["compare", "comparison", "versus", "vs", "difference", "better"],
+    "data": ["data", "statistics", "metric", "trend", "pattern", "chart", "dashboard", "csv",
+              "spreadsheet", "dataset"],
+    "security": ["security", "vulnerability", "attack", "encryption", "password", "exploit",
+                  "firewall", "gdpr", "privacy"],
+    "cost": ["cost", "budget", "expense", "cheap", "price", "financial", "roi"],
+    "humor": ["funny", "joke", "humorous", "kvlt", "metal", "nihil"],
+    "music": ["music", "metal", "band", "song", "album", "guitar"],
+}
+
+# Generalist fallback roles used when no capability matches
+_GENERALIST_ROLES = ("creative", "technical", "research")
+
+
+def extract_task_features(user_request: str, task_category: str = "other") -> List[str]:
+    """Derive task features from the user request and task category.
+
+    Returns a deduplicated list of feature tags like ["design", "opinion"].
+    """
+    lower = user_request.lower()
+    features: List[str] = []
+
+    for feature, keywords in TASK_FEATURE_KEYWORDS.items():
+        for kw in keywords:
+            if kw in lower:
+                features.append(feature)
+                break  # one match per feature is enough
+
+    # Add features implied by the task category
+    category_features: Dict[str, List[str]] = {
+        "coding_task": ["technical", "code"],
+        "creative_writing": ["creative"],
+        "factual_question": ["research"],
+        "comparison": ["comparison", "research"],
+        "analysis": ["analysis"],
+        "summarization": ["research"],
+        "opinion_discussion": ["opinion"],
+        "planning": ["analysis"],
+    }
+    for f in category_features.get(task_category, []):
+        if f not in features:
+            features.append(f)
+
+    return features
+
+
+@dataclass
+class RoleScore:
+    """Scoring details for a single role — used for transparent logging."""
+    role_key: str
+    role_label: str
+    score: int
+    matched_capabilities: List[str]
+    is_persona: bool
+    filtered_reason: str = ""  # why it was excluded, if any
+
+
+def score_roles(
+    task_features: List[str],
+    active_role_keys: List[str],
+    config: WorkflowConfig,
+    task_category: str = "other",
+) -> List[RoleScore]:
+    """Score each active role by capability overlap with task features.
+
+    Returns all RoleScore objects (including filtered ones) for transparency.
+    """
+    feature_set = set(task_features)
+    results: List[RoleScore] = []
+
+    # Import here to avoid circular — role labels come from the caller
+    for role_key in active_role_keys:
+        capabilities = ROLE_CAPABILITIES.get(role_key, [])
+        meta = ROLE_RELEVANCE.get(role_key, {})
+        is_persona = meta.get("is_persona", False)
+        role_label = meta.get("description", role_key)
+
+        # Capability overlap score
+        matched = [cap for cap in capabilities if cap in feature_set]
+        score = len(matched)
+
+        # Task-category affinity bonus (from ROLE_RELEVANCE)
+        role_tasks = meta.get("task_types", [])
+        if task_category in role_tasks:
+            score += 2
+
+        rs = RoleScore(
+            role_key=role_key,
+            role_label=role_label,
+            score=score,
+            matched_capabilities=matched,
+            is_persona=is_persona,
+        )
+
+        # Filter personas unless allowed
+        if is_persona and not config.allow_persona_roles:
+            rs.filtered_reason = "persona role not allowed"
+
+        results.append(rs)
+
+    return results
+
+
 def select_relevant_roles(
     user_request: str,
     active_role_keys: List[str],
     config: WorkflowConfig,
     task_category: str = "other",
 ) -> List[str]:
-    """Select only the most relevant specialist roles for a given request.
+    """Select the most relevant specialist roles for a given request.
 
-    Scores each active role by keyword match frequency and task-category affinity,
-    filters persona roles based on config, and returns at most
-    config.max_specialists_per_task roles.
+    Uses capability-based scoring: extracts task features from the request,
+    scores each active role by capability overlap, and returns the top roles
+    up to ``config.max_specialists_per_task``.
 
-    If config.always_include_research_for_factual_tasks is True and the task
-    is factual, the research role is always included.
+    Returns a ``_SelectionResult`` (list subclass) so callers can also access
+    ``.scoring_info`` for transparent trace logging.
     """
-    lower = user_request.lower()
-    scored: List[Tuple[int, str]] = []
+    task_features = extract_task_features(user_request, task_category)
+    role_scores = score_roles(task_features, active_role_keys, config, task_category)
 
-    for role_key in active_role_keys:
-        meta = ROLE_RELEVANCE.get(role_key)
-        if not meta:
-            continue
+    # Separate eligible from filtered
+    eligible = [rs for rs in role_scores if not rs.filtered_reason]
+    eligible.sort(key=lambda rs: (-rs.score, active_role_keys.index(rs.role_key)))
 
-        # Skip persona roles unless config allows them
-        if meta.get("is_persona") and not config.allow_persona_roles:
-            continue
-
-        score = 0
-        for kw in meta.get("keywords", []):
-            if kw.lower() in lower:
-                score += 1
-
-        # Domain affinity — boost if the request touches a role's domain
-        for domain in meta.get("domains", []):
-            if domain.lower() in lower:
-                score += 1
-
-        # Task-category affinity bonus
-        role_tasks = meta.get("task_types", [])
-        if task_category in role_tasks:
-            score += 2
-
-        scored.append((score, role_key))
-
-    # Sort by score descending; keep deterministic order for ties
-    scored.sort(key=lambda x: (-x[0], active_role_keys.index(x[1])))
-
-    # Always include at least one role
-    selected = []
-    for score, role_key in scored:
+    selected: List[str] = []
+    for rs in eligible:
         if len(selected) >= config.max_specialists_per_task:
             break
-        # In strict mode, only include roles with score > 0 (except if we have none)
-        if config.strict_mode and score == 0 and selected:
+        # In strict mode, only include roles with score > 0 (unless we have none yet)
+        if config.strict_mode and rs.score == 0 and selected:
             continue
-        selected.append(role_key)
+        selected.append(rs.role_key)
 
     # Ensure at least one specialist is selected
-    if not selected and scored:
-        selected.append(scored[0][1])
+    if not selected and eligible:
+        selected.append(eligible[0].role_key)
 
-    # Fallback: if no roles matched at all, use the first available core role
+    # Generalist fallback when nothing matched
     if not selected:
-        for rk in active_role_keys:
-            meta = ROLE_RELEVANCE.get(rk, {})
-            if not meta.get("is_persona"):
+        for rk in _GENERALIST_ROLES:
+            if rk in active_role_keys:
                 selected.append(rk)
                 break
 
@@ -567,7 +692,41 @@ def select_relevant_roles(
             and "research" not in selected):
         selected.append("research")
 
-    return selected
+    return _SelectionResult(selected, role_scores, task_features)
+
+
+class _SelectionResult(list):
+    """A list of role keys with attached scoring metadata.
+
+    Behaves exactly like a ``list[str]`` so existing code continues to work,
+    but also carries ``scoring_info`` and ``task_features`` for trace logging.
+    """
+
+    def __init__(
+        self,
+        selected: List[str],
+        scoring_info: List[RoleScore],
+        task_features: List[str],
+    ):
+        super().__init__(selected)
+        self.scoring_info = scoring_info
+        self.task_features = task_features
+
+    def format_trace(self, role_labels: Optional[Dict[str, str]] = None) -> str:
+        """Return a human-readable ROLE SCORING trace block."""
+        lines = ["── ROLE SCORING ──"]
+        lines.append(f"Task features: {self.task_features}")
+        for rs in sorted(self.scoring_info, key=lambda r: -r.score):
+            label = (role_labels or {}).get(rs.role_key, rs.role_key)
+            status = "SELECTED" if rs.role_key in self else "skipped"
+            if rs.filtered_reason:
+                status = f"FILTERED ({rs.filtered_reason})"
+            caps = ", ".join(rs.matched_capabilities) if rs.matched_capabilities else "none"
+            lines.append(
+                f"  {label}: score={rs.score} caps=[{caps}] → {status}"
+            )
+        lines.append("──────────────────")
+        return "\n".join(lines)
 
 
 # ============================================================
@@ -715,6 +874,44 @@ def compress_final_answer(
                 answer = paragraphs[0]
 
     return answer
+
+
+def postprocess_format_fixes(text: str) -> str:
+    """Apply lightweight format fixes before QA evaluation.
+
+    Converts common formatting artefacts so QA can focus on content quality
+    rather than failing for cosmetic issues.
+    """
+    # Remove markdown headings (# / ## / ###)
+    text = re.sub(r'^#{1,4}\s+', '', text, flags=re.MULTILINE)
+
+    # Convert bullet-list lines to flowing sentences
+    def _bullets_to_sentences(m: re.Match) -> str:
+        lines = m.group(0).strip().splitlines()
+        sentences = []
+        for line in lines:
+            cleaned = re.sub(r'^\s*[-•*]\s+', '', line).strip()
+            if cleaned:
+                # Ensure it ends with a full stop
+                if cleaned[-1] not in '.!?':
+                    cleaned += '.'
+                sentences.append(cleaned)
+        return ' '.join(sentences)
+
+    text = re.sub(
+        r'(?:^\s*[-•*]\s+.+\n?){2,}',
+        _bullets_to_sentences,
+        text,
+        flags=re.MULTILINE,
+    )
+
+    # Collapse runs of 3+ blank lines into 2
+    text = re.sub(r'\n{3,}', '\n\n', text)
+
+    # Remove leftover JSON-like traces (e.g. {"status": ...} blocks)
+    text = re.sub(r'\{[^{}]*"status"\s*:[^{}]*\}', '', text)
+
+    return text.strip()
 
 
 # ============================================================
